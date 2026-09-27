@@ -28,6 +28,8 @@ export interface LaunchContext {
   options: Record<string, unknown> | null;
   chosen?: boolean;
   environment?: { pluginId: string; kind: string } | null;
+  /** CanvasTTY: a subagent in (or below) the folder the person chose for its orchestrator, as a real path. */
+  trustedFolder?: string;
 }
 
 export type LaunchAnswer = Contribution | { refuse: { reason: string } } | null;
@@ -39,6 +41,11 @@ export type CheckResult =
 interface Stored { settings: AccountsSettings; keyOrigins: Record<string, string> }
 
 const originOf = (url: string): string => { try { return new URL(url).origin; } catch { return ''; } };
+
+/** The agent's own vendor API: its native auto reviewer is then the vendor's model, not a third party's. */
+const VENDOR_ORIGINS: Partial<Record<Harness, string>> = { claude: 'https://api.anthropic.com', codex: 'https://api.openai.com' };
+export const thirdPartyModel = (harness: Harness, baseUrl: string | null): boolean =>
+  !baseUrl || VENDOR_ORIGINS[harness] !== originOf(baseUrl);
 const refuse = (reason: string): LaunchAnswer => ({ refuse: { reason: reason.replace(/[\u0000-\u001f\u007f]+/gu, ' ').slice(0, 240) } });
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
@@ -233,7 +240,10 @@ export class AccountsService {
     let home: string | undefined;
     try {
       if (harness === 'claude' || harness === 'codex') home = await ensureHome(homeFolder(this.dataDir, harness, account.id));
-      if (harness === 'claude') await seedClaudeHome(home!, trust ? [context.cwd] : []);
+      // The account's own config home: the folder the person trusted for this launch, or (for a subagent) the one they
+      // chose for its orchestrator, which CanvasTTY hands over as trustedFolder.
+      const folders = [...(trust ? [context.cwd] : []), ...(typeof context.trustedFolder === 'string' ? [context.trustedFolder] : [])];
+      if (harness === 'claude') await seedClaudeHome(home!, folders);
     } catch (error) {
       return refuse(`The account's agent home could not be prepared: ${errorText(error)}`);
     }
@@ -250,6 +260,8 @@ export class AccountsService {
       return refuse(errorText(error));
     }
     contribution.args.push(...effortArgs);
+    // A weak model's own auto classifier is not a safety boundary: CanvasTTY runs "auto" as accept-edits for it.
+    if (thirdPartyModel(harness, account.baseUrl)) contribution.thirdPartyModel = true;
     return contribution;
   }
 

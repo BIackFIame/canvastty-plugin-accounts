@@ -31,13 +31,18 @@ answer with `launchOptions` to pass to `spawn_agent`.
   private `--config-file`.
 - Ollama on this computer: the model is pinned `name:local`, so the server itself refuses to forward it to the cloud;
   the launch checks first that Ollama runs, the model is installed and can call tools.
+- Every account launch is marked `thirdPartyModel` (unless it is the agent's own vendor API: Anthropic for Claude Code,
+  OpenAI for Codex), so CanvasTTY runs the **Auto** profile as accept-edits in the CLI's sandbox: the CLI's own auto
+  reviewer would be the account's model, and a weak model's classifier is not a safety boundary.
+- A subagent in (or below) the folder the person chose for its orchestrator: the folder CanvasTTY hands over as
+  `trustedFolder` is marked trusted in the account's own Claude config (Codex gets it from CanvasTTY directly).
 
 Keys stay in CanvasTTY's encrypted plugin secrets; CanvasTTY puts them into the agent's environment itself and masks
 them in everything other agents read. Nothing is written to `~/.claude`, `~/.codex`, `~/.qwen`, `~/.kimi` or
 `~/.ollama`, and the agents' own sign-ins are never used for an account's endpoint.
 
 Needs CanvasTTY with the account launch points (`optionsFrom` launcher lists, `spawn_agent` `launchOptions`, merged
-Claude `--settings`).
+Claude `--settings`); the Auto downgrade and `trustedFolder` need the Auto profile points (older CanvasTTY ignores them).
 
 ## Develop
 

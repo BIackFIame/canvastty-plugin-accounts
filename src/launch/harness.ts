@@ -57,6 +57,8 @@ export interface Contribution {
   secretEnv: Record<string, string>;
   args: string[];
   files: Array<{ relPath: string; content: string }>;
+  /** CanvasTTY runs its "auto" profile as accept-edits: the agent's own auto reviewer would be this model. */
+  thirdPartyModel?: boolean;
 }
 
 /** TOML basic string (Codex `-c key=value` parses the value as TOML): JSON escapes are valid TOML escapes. */

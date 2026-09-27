@@ -719,6 +719,8 @@ var originOf = (url) => {
     return "";
   }
 };
+var VENDOR_ORIGINS = { claude: "https://api.anthropic.com", codex: "https://api.openai.com" };
+var thirdPartyModel = (harness, baseUrl) => !baseUrl || VENDOR_ORIGINS[harness] !== originOf(baseUrl);
 var refuse = (reason) => ({ refuse: { reason: reason.replace(/[\u0000-\u001f\u007f]+/gu, " ").slice(0, 240) } });
 var errorText = (error) => error instanceof Error ? error.message : String(error);
 var AccountsService = class {
@@ -906,7 +908,8 @@ var AccountsService = class {
     let home;
     try {
       if (harness === "claude" || harness === "codex") home = await ensureHome(homeFolder(this.dataDir, harness, account.id));
-      if (harness === "claude") await seedClaudeHome(home, trust ? [context.cwd] : []);
+      const folders = [...trust ? [context.cwd] : [], ...typeof context.trustedFolder === "string" ? [context.trustedFolder] : []];
+      if (harness === "claude") await seedClaudeHome(home, folders);
     } catch (error) {
       return refuse(`The account's agent home could not be prepared: ${errorText(error)}`);
     }
@@ -930,6 +933,7 @@ var AccountsService = class {
       return refuse(errorText(error));
     }
     contribution.args.push(...effortArgs);
+    if (thirdPartyModel(harness, account.baseUrl)) contribution.thirdPartyModel = true;
     return contribution;
   }
   // ---- orchestrator tools ----

@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { AccountsService } from '../src/service/accounts.ts';
+import { AccountsService, thirdPartyModel } from '../src/service/accounts.ts';
 import { startFakeOllama } from './helpers/fake-ollama.mjs';
 
 const KEY = ['sk', 'fixture', 'glm', 'f00dfeed'.repeat(4)].join('-');
@@ -80,6 +80,29 @@ test('Codex on local Ollama: the account CODEX_HOME, a private catalog, and a su
   assert.equal(person.files[0].relPath, 'codex-model.json');
   const subagent = await service.prepare(context({ provider: 'codex', role: 'subagent', options: { trustFolder: true } }));
   assert.ok(!subagent.args.some(arg => arg.startsWith('projects=')));
+});
+
+test('an account model is third-party: CanvasTTY runs "auto" as accept-edits; the vendor\'s own API is not', async (t) => {
+  const { service, context } = await fixture(t);
+  const local = await service.prepare(context({ profile: 'auto' }));
+  assert.equal(local.thirdPartyModel, true);
+  assert.equal((await service.prepare(context({ provider: 'codex', profile: 'auto' }))).thirdPartyModel, true);
+  assert.equal(await service.prepare(context({ options: { account: 'none' } })), null, 'the agent\'s own sign-in is not marked');
+  assert.equal(thirdPartyModel('claude', 'https://api.anthropic.com'), false);
+  assert.equal(thirdPartyModel('codex', 'https://api.openai.com/v1'), false);
+  assert.equal(thirdPartyModel('claude', 'https://api.z.ai/api/anthropic'), true);
+  assert.equal(thirdPartyModel('codex', 'https://api.anthropic.com'), true);
+  assert.equal(thirdPartyModel('claude', null), true);
+});
+
+test('a Claude subagent in the orchestrator\'s folder (CanvasTTY\'s trustedFolder) is trusted in the account home only', async (t) => {
+  const { service, dataDir, context, project } = await fixture(t);
+  const docs = join(project, 'docs');
+  await mkdir(docs);
+  const answer = await service.prepare(context({ role: 'subagent', cwd: docs, trustedFolder: docs, options: { trustFolder: true } }));
+  assert.equal(answer.refuse, undefined);
+  const seeded = JSON.parse(await readFile(join(dataDir, 'homes', 'claude-qwen-local', '.claude.json'), 'utf8'));
+  assert.deepEqual(Object.keys(seeded.projects ?? {}), [docs], 'the model-chosen trustFolder option is still ignored; the host folder counts');
 });
 
 test('refusals: a missing account or agent, a non-local environment, a stopped Ollama, an uninstalled or tool-less model, a bad effort', async (t) => {
