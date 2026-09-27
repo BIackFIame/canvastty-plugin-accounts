@@ -1,0 +1,293 @@
+import type { Host } from '../rpc.ts';
+import { apiKeyProblem, apiKeyProblemMessage, envSubstitutionProblem, openCodeKeyRefusal } from '../shared/apiKeyHygiene.ts';
+import {
+  HARNESS_LABELS, HARNESSES, PRESETS, accountKeyed, harnessSupport, loadSettings, ollamaShapeOf, ollamaWireModel, protocolOf, secretKeyOf,
+  validateSettings, type Account, type AccountsSettings, type Harness
+} from '../shared/accounts.ts';
+import { buildHarnessLaunch, codexTrustArguments, type Contribution } from '../launch/harness.ts';
+import { effortArguments } from '../launch/effort.ts';
+import { ensureHome, homeFolder, projectRouteProblem, providerIdOf, removeHomes, seedClaudeHome } from '../launch/homes.ts';
+import { detectOllama, preflightOllama, type OllamaDetection, type OllamaFetch, type OllamaPreflight } from '../launch/ollama.ts';
+import { listRoutes, pickAccount, type RouteFacts } from '../routes/routes.ts';
+
+/**
+ * The Accounts service: the launch contributor behind the launcher's "Model account" (and reasoning effort), the
+ * orchestrator tools, and the plugin's settings page. Accounts live in the plugin's storage; keys live in the plugin's
+ * secrets, written by the settings page and put into the agent's environment by CanvasTTY itself (`secretEnv`), so
+ * this process sees a key only to check that it exists, where it was saved for, and its format.
+ */
+
+const STORAGE_KEY = 'accounts';
+/** CanvasTTY waits 5 s for a launch; the Ollama check gets most of it. */
+const PREFLIGHT_BUDGET_MS = 3_500;
+
+/** `canvastty.launch.prepare` as CanvasTTY ≥ core2/8 sends it. */
+export interface LaunchContext {
+  sessionId: string; provider: string; profile: string; role: string; cwd: string; restoring: boolean; resume: boolean;
+  parentSessionId?: string;
+  options: Record<string, unknown> | null;
+  chosen?: boolean;
+  environment?: { pluginId: string; kind: string } | null;
+}
+
+export type LaunchAnswer = Contribution | { refuse: { reason: string } } | null;
+
+export type CheckResult =
+  | { kind: 'ollama'; running: boolean; version: string | null; problem: OllamaDetection['problem']; models: Array<{ name: string; local: boolean; tools: boolean; size: string | null }>; model: { installed: boolean; tools: boolean } | null }
+  | { kind: 'key'; ok: boolean; problem: string | null };
+
+interface Stored { settings: AccountsSettings; keyOrigins: Record<string, string> }
+
+const originOf = (url: string): string => { try { return new URL(url).origin; } catch { return ''; } };
+const refuse = (reason: string): LaunchAnswer => ({ refuse: { reason: reason.replace(/[\u0000-\u001f\u007f]+/gu, ' ').slice(0, 240) } });
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+export class AccountsService {
+  settings: AccountsSettings;
+  private keyOrigins: Record<string, string>;
+  private readonly host: Host;
+  private readonly dataDir: string;
+  private readonly transport: OllamaFetch | undefined;
+  private readonly checks = new Map<string, CheckResult | { error: string }>();
+
+  constructor(options: { host: Host; dataDir: string; saved?: unknown; transport?: OllamaFetch }) {
+    this.host = options.host;
+    this.dataDir = options.dataDir;
+    this.transport = options.transport;
+    const saved = options.saved && typeof options.saved === 'object' ? options.saved as Partial<Stored> : {};
+    this.settings = loadSettings(saved.settings);
+    this.keyOrigins = {};
+    for (const [id, origin] of Object.entries(saved.keyOrigins ?? {})) if (typeof origin === 'string' && this.find(id)) this.keyOrigins[id] = origin;
+  }
+
+  private find(id: unknown): Account | undefined { return this.settings.accounts.find(account => account.id === id); }
+
+  private async persist(): Promise<void> {
+    await this.host.callHost('storage.set', { key: STORAGE_KEY, value: { settings: this.settings, keyOrigins: this.keyOrigins } satisfies Stored });
+  }
+
+  /** The key of a keyed account, read in this process only to check it (the value is masked for agents by CanvasTTY). */
+  private async readKey(account: Account): Promise<string | null> {
+    let value: unknown;
+    try { value = await this.host.callHost('secrets.get', { key: secretKeyOf(account.id) }); } catch { throw new Error('The plugin\'s secrets are unavailable.'); }
+    return typeof value === 'string' && value ? value : null;
+  }
+
+  private async keyState(account: Account): Promise<'ok' | 'missing' | 'other-address'> {
+    if (!(await this.readKey(account))) return 'missing';
+    return this.keyOrigins[account.id] === originOf(account.baseUrl) ? 'ok' : 'other-address';
+  }
+
+  // ---- the settings page ----
+
+  async state(): Promise<{ settings: AccountsSettings; keys: Record<string, 'ok' | 'missing' | 'other-address' | 'none'>; checks: Record<string, CheckResult | { error: string }>; presets: typeof PRESETS }> {
+    const keys: Record<string, 'ok' | 'missing' | 'other-address' | 'none'> = {};
+    for (const account of this.settings.accounts) {
+      keys[account.id] = accountKeyed(account) ? await this.keyState(account).catch(() => 'missing' as const) : 'none';
+    }
+    return { settings: this.settings, keys, checks: Object.fromEntries(this.checks), presets: PRESETS };
+  }
+
+  async save(value: unknown): Promise<{ saved: true }> {
+    const next = validateSettings(value);
+    const previous = new Map(this.settings.accounts.map(account => [account.id, account]));
+    for (const [id, account] of previous) {
+      const kept = next.accounts.find(entry => entry.id === id);
+      if (!kept) {
+        delete this.keyOrigins[id];
+        this.checks.delete(id);
+        await removeHomes(this.dataDir, id).catch(() => undefined);
+      } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
+        // A key is never sent to an address it was not saved for: the person saves it again.
+        delete this.keyOrigins[id];
+        this.checks.delete(id);
+      } else if (kept.model !== account.model) this.checks.delete(id);
+    }
+    this.settings = next;
+    await this.persist();
+    return { saved: true };
+  }
+
+  /** The page saved or removed a key: bind it to the account's address as it is now. */
+  async keyChanged(accountId: unknown): Promise<null> {
+    const account = this.find(accountId);
+    if (!account) throw new Error('No such account.');
+    if (await this.readKey(account)) this.keyOrigins[account.id] = originOf(account.baseUrl);
+    else delete this.keyOrigins[account.id];
+    this.checks.delete(account.id);
+    await this.persist();
+    return null;
+  }
+
+  /**
+   * «Проверить»: an Ollama account on this computer lists the server's models; an account with a key gets a format
+   * check of the saved key only. Nothing is sent to a paid API.
+   */
+  async check(accountId: unknown): Promise<CheckResult | { error: string }> {
+    const account = this.find(accountId);
+    if (!account) throw new Error('No such account.');
+    let result: CheckResult | { error: string };
+    try {
+      const shape = ollamaShapeOf(account);
+      if (shape === 'local' || shape === 'cloud-local') {
+        const detection = await detectOllama(account.baseUrl, this.transport);
+        const models = detection.models.filter(model => shape === 'local' ? model.source === 'local' : true)
+          .map(model => ({ name: model.name, local: model.source === 'local', tools: model.agentReady, size: model.parameterSize }));
+        const wanted = account.model.replace(/:local$/u, '');
+        const listed = detection.models.find(model => model.name === wanted || model.name === `${wanted}:latest`);
+        result = { kind: 'ollama', running: detection.running, version: detection.version, problem: detection.problem, models,
+          model: shape === 'local' && detection.running ? { installed: !!listed && listed.source === 'local', tools: !!listed?.agentReady } : null };
+      } else {
+        const key = await this.readKey(account);
+        const problem = !key ? 'No key is saved.'
+          : this.keyOrigins[account.id] !== originOf(account.baseUrl) ? 'The key was saved for another address; save it again.'
+            : apiKeyProblem(key) ? apiKeyProblemMessage(apiKeyProblem(key)!)
+              : key.length < 16 ? 'The key is shorter than any provider\'s keys; copy it again.' : null;
+        result = { kind: 'key', ok: problem === null, problem };
+      }
+    } catch (error) {
+      result = { error: errorText(error) };
+    }
+    this.checks.set(account.id, result);
+    return result;
+  }
+
+  // ---- CanvasTTY: the launcher list and the launch ----
+
+  /** `canvastty.launch.options`: the accounts the person allowed for this agent. */
+  launchOptions(provider: unknown): Record<string, Array<{ value: string; label: string }>> {
+    const harness = HARNESSES.find(entry => entry === provider);
+    if (!harness) return { account: [] };
+    return {
+      account: this.settings.accounts.filter(account => account.agents.includes(harness) && harnessSupport(harness, account).ok)
+        .map(account => ({ value: account.id, label: `${account.label} · ${account.model}` }))
+    };
+  }
+
+  /** `canvastty.launch.prepare`. */
+  async prepare(context: LaunchContext): Promise<LaunchAnswer> {
+    if (context.chosen === false) return null;
+    const options = context.options ?? {};
+    const accountId = typeof options.account === 'string' && options.account ? options.account : 'none';
+    const effort = typeof options.effort === 'string' && options.effort ? options.effort : 'default';
+    // Only a person's launch may pre-answer the folder question; a subagent's options come from a model.
+    const trust = options.trustFolder === true && context.role !== 'subagent';
+    let effortArgs: string[];
+    try { effortArgs = effortArguments(context.provider, effort); } catch (error) { return refuse(errorText(error)); }
+
+    if (accountId === 'none') {
+      // The agent's own sign-in: only effort, and Codex's per-run folder trust (never written to ~/.codex).
+      const args = [...effortArgs, ...(trust && context.provider === 'codex' ? codexTrustArguments([context.cwd]) : [])];
+      return args.length ? { env: {}, secretEnv: {}, args, files: [] } : null;
+    }
+    const account = this.find(accountId);
+    if (!account) return refuse(`Model account ${accountId.slice(0, 40)} no longer exists; choose another one in the launcher.`);
+    const harness = HARNESSES.find(entry => entry === context.provider) as Harness | undefined;
+    if (!harness || !account.agents.includes(harness)) return refuse(`${account.label} is not set up for ${(HARNESS_LABELS as Record<string, string>)[context.provider] ?? context.provider}.`);
+    const support = harnessSupport(harness, account);
+    if (!support.ok) return refuse(support.reason === 'responses-api' ? 'Codex needs an endpoint with the OpenAI Responses API.' : `${HARNESS_LABELS[harness]} cannot run on this account.`);
+    if (context.environment && context.environment.kind !== 'worktree') {
+      return refuse(`A model account runs agents on this computer (a worktree is fine), not in "${context.environment.kind}".`);
+    }
+
+    const protocol = protocolOf(account);
+    const shape = ollamaShapeOf(account);
+    const keyed = accountKeyed(account);
+    let keyValue: string | undefined;
+    if (keyed) {
+      const key = await this.readKey(account).catch(() => null);
+      if (!key) return refuse(`${account.label} has no key; save one in the Accounts settings.`);
+      if (this.keyOrigins[account.id] !== originOf(account.baseUrl)) return refuse(`The key of ${account.label} was saved for another address; save it again in the Accounts settings.`);
+      const problem = apiKeyProblem(key);
+      if (problem) return refuse(`${apiKeyProblemMessage(problem)} (${account.label})`);
+      // L27: OpenCode substitutes {env:…} into its JSON as raw text; a key that needs escaping would print the config.
+      const substitution = harness === 'opencode' ? envSubstitutionProblem(key) : null;
+      if (substitution) return refuse(openCodeKeyRefusal(substitution));
+      if (harness === 'kimi') keyValue = key;
+      if (harness === 'claude') {
+        const route = await projectRouteProblem(context.cwd);
+        if (route) return refuse(route);
+      }
+    }
+
+    let preflight: OllamaPreflight | null = null;
+    if (shape === 'local' || shape === 'cloud-local') {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        preflight = await Promise.race([
+          preflightOllama({ baseUrl: account.baseUrl, shape, model: account.model, harness }, this.transport),
+          new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Ollama did not answer in time.')), PREFLIGHT_BUDGET_MS); })
+        ]);
+      } catch (error) {
+        return refuse(errorText(error));
+      } finally { if (timer) clearTimeout(timer); }
+      if (preflight.note) this.host.log('info', `${account.label}: ${preflight.note}`);
+    }
+    let model = account.model;
+    if (shape === 'cloud-direct') {
+      const wire = ollamaWireModel(shape, account.model);
+      if (!wire.ok) return refuse(`Model ${account.model} is not an Ollama Cloud name.`);
+      model = wire.model;
+    } else if (preflight) model = preflight.wireModel;
+
+    let home: string | undefined;
+    try {
+      if (harness === 'claude' || harness === 'codex') home = await ensureHome(homeFolder(this.dataDir, harness, account.id));
+      if (harness === 'claude') await seedClaudeHome(home!, trust ? [context.cwd] : []);
+    } catch (error) {
+      return refuse(`The account's agent home could not be prepared: ${errorText(error)}`);
+    }
+    let contribution: Contribution;
+    try {
+      contribution = buildHarnessLaunch({
+        harness, protocol, ...(shape ? { ollamaShape: shape } : {}), baseUrl: account.baseUrl, model,
+        ...(keyed ? { secretKey: secretKeyOf(account.id) } : {}), ...(keyValue ? { keyValue } : {}),
+        providerId: providerIdOf(account.id), ...(home ? { home } : {}), contextWindow: preflight?.contextWindow ?? null,
+        disableWebSearch: preflight?.cloudFeatures === true || shape === 'cloud-direct',
+        ...(trust && harness === 'codex' ? { trustedFolders: [context.cwd] } : {})
+      });
+    } catch (error) {
+      return refuse(errorText(error));
+    }
+    contribution.args.push(...effortArgs);
+    return contribution;
+  }
+
+  // ---- orchestrator tools ----
+
+  private facts(): RouteFacts {
+    const detections = new Map<string, Promise<OllamaDetection>>();
+    return {
+      key: account => this.keyState(account).catch(() => 'missing' as const),
+      ollama: baseUrl => {
+        if (!detections.has(baseUrl)) detections.set(baseUrl, detectOllama(baseUrl, this.transport, 1_500));
+        return detections.get(baseUrl)!;
+      }
+    };
+  }
+
+  async tool(name: string, input: Record<string, unknown>): Promise<{ content: unknown; isError?: boolean }> {
+    const text = (value: unknown, max: number): string | undefined => typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined;
+    const provider = text(input.provider, 32);
+    const model = text(input.model, 100);
+    const effort = text(input.effort, 20);
+    if (name === 'list_routes') {
+      const routes = await listRoutes(this.settings.accounts, this.facts(), { ...(provider ? { provider } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      return { content: {
+        routes,
+        signIn: 'Each agent\'s own CLI sign-in is not listed here: spawn_agent without launchOptions uses it, and CanvasTTY reports when it does not work.',
+        howTo: 'Pass a ready route\'s launchOptions to spawn_agent unchanged (same provider).'
+      } };
+    }
+    if (name === 'pick_account') {
+      if (!provider) return { content: 'Give the agent in `provider` (claude, codex, opencode, qwen or kimi).', isError: true };
+      try {
+        const pick = await pickAccount(this.settings.accounts, this.facts(), { provider, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+        return { content: { ...pick, spawn: { provider, launchOptions: pick.launchOptions } } };
+      } catch (error) {
+        return { content: errorText(error), isError: true };
+      }
+    }
+    return { content: `Unknown tool ${name.slice(0, 40)}.`, isError: true };
+  }
+}

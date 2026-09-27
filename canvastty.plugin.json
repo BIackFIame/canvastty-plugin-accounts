@@ -1,0 +1,191 @@
+{
+  "apiVersion": 2,
+  "id": "canvastty-accounts",
+  "name": "CanvasTTY Accounts",
+  "version": "0.1.0",
+  "description": "Any agent on any model: run Claude Code, Codex, OpenCode, Qwen Code or Kimi on a local Ollama model, Ollama Cloud, Z.AI, MiniMax, OpenRouter or any compatible API, chosen per launch as a Model account, with reasoning effort per launch. Orchestrators list and pick accounts for subagents. The agents' own sign-ins and ~/.claude, ~/.codex, ~/.ollama stay untouched.",
+  "description.ru": "Любой агент на любой модели: Claude Code, Codex, OpenCode, Qwen Code или Kimi на локальной модели Ollama, в Ollama Cloud, Z.AI, MiniMax, OpenRouter или любом совместимом API — учётная запись модели выбирается при запуске, как и глубина рассуждений. Оркестраторы видят и выбирают учётные записи для субагентов. Собственные входы агентов и ~/.claude, ~/.codex, ~/.ollama не меняются.",
+  "author": "CanvasTTY contributors",
+  "permissions": [
+    "storage",
+    "secrets",
+    "launch:contribute",
+    "tools:agents"
+  ],
+  "coreFiles": [
+    {
+      "path": "README.md",
+      "bytes": 2944,
+      "sha256": "b6ff01c4a2dd364a90a79f5edc16f2f4c3d718236af850828d8c86bc74eb8d6a"
+    },
+    {
+      "path": "README.ru.md",
+      "bytes": 4417,
+      "sha256": "57ed764b42af865f0406de5a301bd8497a44d44e156d9b59f2a84f03377f00c1"
+    },
+    {
+      "path": "services/accounts.mjs",
+      "bytes": 54512,
+      "sha256": "5c370585b07b08e3e94765e51d86cb6685a1f692db96d4a9d4e619c079d23795"
+    },
+    {
+      "path": "settings/accounts.html",
+      "bytes": 483,
+      "sha256": "784076533e352d6ea39bef33684f4b1796b40479d5c77b769ada276a300b1cef"
+    },
+    {
+      "path": "settings/accounts.js",
+      "bytes": 24730,
+      "sha256": "b40c5a37391cd6bc8fd2ee322cbb9452c367f816545e025fa24c9b06936e2019"
+    },
+    {
+      "path": "settings/accounts.css",
+      "bytes": 1314,
+      "sha256": "614862a392abaa3d7f254be45d8ba535325f0fe38d58e73459ab029c2306502a"
+    }
+  ],
+  "services": [
+    {
+      "id": "accounts",
+      "title": "Accounts",
+      "description": "Prepares launches on a chosen model account and answers orchestrators' route questions.",
+      "entry": "services/accounts.mjs",
+      "launch": {
+        "appliesTo": [
+          "claude",
+          "codex",
+          "opencode",
+          "qwen",
+          "kimi",
+          "grok"
+        ],
+        "fields": [
+          {
+            "key": "account",
+            "label": "Model account",
+            "kind": "select",
+            "optionsFrom": "service",
+            "default": "none",
+            "options": [
+              {
+                "value": "none",
+                "label": "The agent's own sign-in"
+              }
+            ]
+          },
+          {
+            "key": "effort",
+            "label": "Reasoning effort",
+            "kind": "select",
+            "default": "default",
+            "options": [
+              {
+                "value": "default",
+                "label": "Default"
+              },
+              {
+                "value": "minimal",
+                "label": "Minimal (Codex)"
+              },
+              {
+                "value": "low",
+                "label": "Low — faster and cheaper"
+              },
+              {
+                "value": "medium",
+                "label": "Medium"
+              },
+              {
+                "value": "high",
+                "label": "High — more careful, slower"
+              },
+              {
+                "value": "xhigh",
+                "label": "Extra high"
+              },
+              {
+                "value": "max",
+                "label": "Max (Claude Code) — most expensive"
+              }
+            ]
+          },
+          {
+            "key": "trustFolder",
+            "label": "I trust this folder (skip the agent's folder question for this account)",
+            "kind": "boolean",
+            "default": false
+          }
+        ]
+      },
+      "tools": [
+        {
+          "name": "list_routes",
+          "description": "List the person's model accounts you can start a subagent on: agent (provider), account, model, where it runs, and whether it is ready now (key saved, Ollama running, model installed with tool calling) or why not. A ready route has launchOptions: pass them unchanged to spawn_agent with the same provider. Each agent's own CLI sign-in is not listed: spawn_agent without launchOptions uses it.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string",
+                "description": "Only this agent: claude, codex, opencode, qwen or kimi."
+              },
+              "model": {
+                "type": "string",
+                "description": "Only accounts whose model name contains this text."
+              },
+              "effort": {
+                "type": "string",
+                "description": "Reasoning effort to put into launchOptions: default, minimal, low, medium, high, xhigh or max (as the agent supports)."
+              }
+            },
+            "additionalProperties": false
+          },
+          "roles": [
+            "orchestrator"
+          ]
+        },
+        {
+          "name": "pick_account",
+          "description": "Pick the model account a subagent of this agent should run on: the first ready one in the person's order, skipping accounts that cannot work right now (no key, Ollama not running, model missing), with the reason. Returns spawn: { provider, launchOptions } to pass to spawn_agent. An error means no account is ready: spawn without launchOptions to use the agent's own sign-in, or ask the person.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string",
+                "description": "The agent: claude, codex, opencode, qwen or kimi."
+              },
+              "model": {
+                "type": "string",
+                "description": "Prefer accounts whose model name contains this text."
+              },
+              "effort": {
+                "type": "string",
+                "description": "Reasoning effort: default, minimal, low, medium, high, xhigh or max (as the agent supports)."
+              }
+            },
+            "required": [
+              "provider"
+            ],
+            "additionalProperties": false
+          },
+          "roles": [
+            "orchestrator"
+          ]
+        }
+      ]
+    }
+  ],
+  "contributions": [
+    {
+      "id": "settings",
+      "kind": "canvas-app",
+      "title": "Model accounts",
+      "description": "Model accounts for agents: Ollama, Ollama Cloud, Z.AI, MiniMax, OpenRouter and compatible APIs.",
+      "entry": "settings/accounts.html",
+      "defaultSize": {
+        "width": 780,
+        "height": 660
+      }
+    }
+  ],
+  "settingsContribution": "settings"
+}

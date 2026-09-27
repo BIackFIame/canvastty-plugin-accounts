@@ -1,0 +1,263 @@
+// The Accounts settings page (bundled to settings/accounts.js). It runs in CanvasTTY's sandboxed plugin frame (no
+// forms: buttons only): accounts go through the service, which validates and stores them; keys are written straight
+// into the plugin's secrets after a local format check and are never read back — the page only learns whether one
+// exists and for which address it was saved.
+import { apiKeyProblem } from '../shared/apiKeyHygiene.ts';
+import {
+  HARNESS_LABELS, HARNESSES, PRESETS, accountKeyed, harnessSupport, newAccountId, secretKeyOf,
+  type Account, type AccountsSettings, type Harness, type PresetId
+} from '../shared/accounts.ts';
+import type { CheckResult } from '../service/accounts.ts';
+
+interface PluginHost {
+  onContext(listener: (context: { appearance: { locale: 'ru' | 'en' } }) => void): void;
+  secrets: { set(key: string, value: string): Promise<void>; delete(key: string): Promise<void> };
+  service: { request(serviceId: string, method: string, params?: unknown): Promise<unknown> };
+}
+interface State {
+  settings: AccountsSettings;
+  keys: Record<string, 'ok' | 'missing' | 'other-address' | 'none'>;
+  checks: Record<string, CheckResult | { error: string }>;
+}
+
+const host = (window as unknown as { CanvasTTYPlugin: PluginHost }).CanvasTTYPlugin;
+const SERVICE = 'accounts';
+
+const STRINGS = {
+  en: {
+    title: 'Model accounts',
+    lead: 'Run Claude Code, Codex, OpenCode, Qwen Code or Kimi on another model: a local Ollama model, Ollama Cloud, Z.AI, MiniMax, OpenRouter or any compatible API. An account is used only when you choose it in the launcher (Advanced → Use CanvasTTY Accounts → Model account) or an orchestrator passes it to a subagent; the agents\' own sign-ins stay untouched, and nothing is written to ~/.claude, ~/.codex or ~/.ollama.',
+    none: 'No accounts yet.', add: 'Add account', provider: 'Provider', name: 'Name', address: 'Address', model: 'Model',
+    responses: 'The endpoint has the OpenAI Responses API (needed for Codex)', agents: 'Agents',
+    saveChanges: 'Save changes', remove: 'Remove', check: 'Check', checking: 'Checking…',
+    key: 'API key', keyOk: 'key saved', keyMissing: 'no key', keyOther: 'key saved for another address — save it again', saveKey: 'Save key', removeKey: 'Remove key',
+    keyWriteOnly: 'Keys are write-only: they are kept in CanvasTTY\'s encrypted plugin secrets and handed to the agent by CanvasTTY.',
+    saved: 'Saved.', notSaved: 'Not saved: ', keySaved: 'Key saved.', keyRemoved: 'Key removed.',
+    ollamaDown: 'Ollama is not running at this address. Open Ollama or run `ollama serve`.', notOllama: 'This address does not answer like Ollama.',
+    ollamaOk: (version: string | null, count: number) => `Ollama ${version ?? ''} is running: ${count} model(s).`,
+    modelOk: 'The model is installed and can call tools.', modelMissing: 'The model is not installed here; pull it yourself or choose one below.',
+    modelNoTools: 'The model cannot call tools, so it cannot drive an agent.', use: 'Use', tools: 'tools', cloud: 'cloud',
+    keyCheckOk: 'The key looks right (format only; nothing was sent to the provider).',
+    keyCheckFail: (problem: string) => `Key: ${problem}`
+  },
+  ru: {
+    title: 'Учётные записи моделей',
+    lead: 'Запускайте Claude Code, Codex, OpenCode, Qwen Code или Kimi на другой модели: локальной в Ollama, в Ollama Cloud, Z.AI, MiniMax, OpenRouter или любом совместимом API. Учётная запись используется, только когда вы выбрали её в окне запуска (Дополнительно → Use CanvasTTY Accounts → Model account) или оркестратор передал её субагенту; собственные входы агентов не меняются, в ~/.claude, ~/.codex и ~/.ollama ничего не пишется.',
+    none: 'Пока нет учётных записей.', add: 'Добавить', provider: 'Провайдер', name: 'Название', address: 'Адрес', model: 'Модель',
+    responses: 'У адреса есть OpenAI Responses API (нужен для Codex)', agents: 'Агенты',
+    saveChanges: 'Сохранить изменения', remove: 'Удалить', check: 'Проверить', checking: 'Проверяю…',
+    key: 'API-ключ', keyOk: 'ключ сохранён', keyMissing: 'нет ключа', keyOther: 'ключ сохранён для другого адреса — сохраните заново', saveKey: 'Сохранить ключ', removeKey: 'Удалить ключ',
+    keyWriteOnly: 'Ключи только записываются: они хранятся в зашифрованных секретах плагина, и агенту их передаёт сам CanvasTTY.',
+    saved: 'Сохранено.', notSaved: 'Не сохранено: ', keySaved: 'Ключ сохранён.', keyRemoved: 'Ключ удалён.',
+    ollamaDown: 'Ollama не запущена по этому адресу. Откройте Ollama или выполните `ollama serve`.', notOllama: 'Этот адрес отвечает не как Ollama.',
+    ollamaOk: (version: string | null, count: number) => `Ollama ${version ?? ''} работает: моделей ${count}.`,
+    modelOk: 'Модель установлена и умеет вызывать инструменты.', modelMissing: 'Модель здесь не установлена; скачайте её сами или выберите ниже.',
+    modelNoTools: 'Модель не умеет вызывать инструменты и не может вести агента.', use: 'Выбрать', tools: 'инструменты', cloud: 'облако',
+    keyCheckOk: 'Ключ выглядит верно (проверен только формат; провайдеру ничего не отправлялось).',
+    keyCheckFail: (problem: string) => `Ключ: ${problem}`
+  }
+};
+const KEY_PROBLEM: Record<'en' | 'ru', Record<string, string>> = {
+  en: { whitespace: 'The key contains a space or line break; copy it again.', control: 'The key contains a control character; copy it again.', quote: 'The key contains a double quote; copy it again.', backslash: 'The key contains a backslash; copy it again.' },
+  ru: { whitespace: 'В ключе пробел или перевод строки; скопируйте его заново.', control: 'В ключе управляющий символ; скопируйте его заново.', quote: 'В ключе двойная кавычка; скопируйте его заново.', backslash: 'В ключе обратная косая черта; скопируйте его заново.' }
+};
+
+let locale: 'en' | 'ru' = 'en';
+let t = STRINGS.en;
+let state: State | null = null;
+const root = document.querySelector('#app')!;
+const status = document.querySelector('#status')!;
+const say = (message: string): void => { status.textContent = message; };
+const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> & { dataset?: Record<string, string> } = {}, ...children: Array<Node | string>): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  const { dataset, ...rest } = props;
+  Object.assign(node, rest);
+  if (dataset) Object.assign(node.dataset, dataset);
+  node.append(...children);
+  return node;
+}
+const button = (label: string, name: string, onClick: () => void): HTMLButtonElement => {
+  const node = el('button', { type: 'button', textContent: label, name });
+  node.addEventListener('click', onClick);
+  return node;
+};
+const field = (label: string, control: HTMLElement): HTMLLabelElement => el('label', { className: 'field' }, el('span', { textContent: label }), control);
+
+async function load(): Promise<void> {
+  state = await host.service.request(SERVICE, 'state') as State;
+  render();
+}
+
+async function saveAccounts(change: (accounts: Account[]) => Account[]): Promise<boolean> {
+  if (!state) return false;
+  const accounts = change(structuredClone(state.settings.accounts));
+  try {
+    await host.service.request(SERVICE, 'save', { settings: { version: 1, accounts } });
+    say(t.saved);
+    await load();
+    return true;
+  } catch (error) {
+    say(`${t.notSaved}${errorText(error)}`);
+    return false;
+  }
+}
+
+function agentBoxes(prefix: string, account: Pick<Account, 'preset' | 'responsesApi'>, chosen: readonly Harness[]): { node: HTMLElement; value(): Harness[] } {
+  const inputs = new Map<Harness, HTMLInputElement>();
+  const node = el('span', { className: 'agents' });
+  for (const harness of HARNESSES) {
+    if (!harnessSupport(harness, account).ok) continue;
+    const input = el('input', { type: 'checkbox', checked: chosen.includes(harness), name: `${prefix}-agent-${harness}` });
+    inputs.set(harness, input);
+    node.append(el('label', { className: 'check' }, input, ` ${HARNESS_LABELS[harness]}`));
+  }
+  return { node, value: () => [...inputs].filter(([, input]) => input.checked).map(([harness]) => harness) };
+}
+
+function checkLine(result: CheckResult | { error: string }, account: Account): HTMLElement {
+  const box = el('div', { className: 'check-result', dataset: { result: account.id } });
+  if ('error' in result) { box.textContent = result.error; return box; }
+  if (result.kind === 'key') { box.textContent = result.ok ? t.keyCheckOk : t.keyCheckFail(result.problem ?? ''); return box; }
+  if (!result.running) { box.textContent = result.problem === 'not-ollama' ? t.notOllama : t.ollamaDown; return box; }
+  const lines = [t.ollamaOk(result.version, result.models.length)];
+  if (result.model) lines.push(result.model.installed ? (result.model.tools ? t.modelOk : t.modelNoTools) : t.modelMissing);
+  box.append(el('div', { textContent: lines.join(' ') }));
+  const list = el('ul', { className: 'models' });
+  for (const model of result.models.slice(0, 40)) {
+    const badges = [model.size, model.tools ? t.tools : null, model.local ? null : t.cloud].filter(Boolean).join(' · ');
+    const item = el('li', {}, el('code', { textContent: model.name }), badges ? ` ${badges} ` : ' ');
+    if (model.tools && model.name !== account.model) {
+      item.append(button(t.use, `use-${account.id}-${model.name}`, () => void saveAccounts(accounts => accounts.map(entry => entry.id === account.id ? { ...entry, model: model.name } : entry))));
+    }
+    list.append(item);
+  }
+  box.append(list);
+  return box;
+}
+
+function accountItem(account: Account): HTMLLIElement {
+  const preset = PRESETS.find(entry => entry.id === account.preset)!;
+  const item = el('li', { className: 'account', dataset: { account: account.id } });
+  item.append(el('div', { className: 'row' }, el('strong', { textContent: account.label }), el('span', { className: 'muted', textContent: `${preset.label} — ${account.baseUrl}` })));
+  const label = el('input', { value: account.label, name: `label-${account.id}` });
+  const model = el('input', { value: account.model, name: `model-${account.id}` });
+  const url = el('input', { value: account.baseUrl, name: `url-${account.id}`, disabled: preset.id === 'ollama-cloud' });
+  const responses = el('input', { type: 'checkbox', checked: account.responsesApi === true, name: `responses-${account.id}` });
+  const agents = agentBoxes(account.id, account, account.agents);
+  const edits = el('div', { className: 'row' }, field(t.name, label), field(t.model, model), field(t.address, url));
+  if (preset.protocol === 'openai') edits.append(el('label', { className: 'check' }, responses, ` ${t.responses}`));
+  item.append(edits, el('div', { className: 'row' }, el('span', { className: 'label', textContent: t.agents }), agents.node));
+  item.append(el('div', { className: 'row' },
+    button(t.saveChanges, `save-${account.id}`, () => void saveAccounts(accounts => accounts.map(entry => entry.id !== account.id ? entry : {
+      ...entry, label: label.value.trim(), model: model.value.trim(), baseUrl: url.value.trim(), agents: agents.value(),
+      ...(preset.protocol === 'openai' ? { responsesApi: responses.checked } : {})
+    }))),
+    button(t.check, `check-${account.id}`, () => {
+      say(t.checking);
+      host.service.request(SERVICE, 'check', { accountId: account.id }).then(() => { say(''); return load(); }, error => say(errorText(error)));
+    }),
+    button(t.remove, `remove-${account.id}`, async () => {
+      if (accountKeyed(account)) await host.secrets.delete(secretKeyOf(account.id)).catch(() => undefined);
+      await saveAccounts(accounts => accounts.filter(entry => entry.id !== account.id));
+    })));
+  if (accountKeyed(account)) {
+    const keyState = state!.keys[account.id] ?? 'missing';
+    const input = el('input', { type: 'password', placeholder: t.key, autocomplete: 'off', name: `key-${account.id}` });
+    item.append(el('div', { className: 'row' },
+      el('span', { className: 'muted', textContent: keyState === 'ok' ? t.keyOk : keyState === 'other-address' ? t.keyOther : t.keyMissing }),
+      input,
+      button(t.saveKey, `save-key-${account.id}`, async () => {
+        const value = input.value.trim();
+        input.value = '';
+        if (!value) return;
+        const problem = apiKeyProblem(value);
+        if (problem) { say(KEY_PROBLEM[locale][problem] ?? problem); return; }
+        try {
+          await host.secrets.set(secretKeyOf(account.id), value);
+          await host.service.request(SERVICE, 'keyChanged', { accountId: account.id });
+          say(t.keySaved);
+        } catch (error) { say(`${t.notSaved}${errorText(error)}`); }
+        await load();
+      }),
+      button(t.removeKey, `remove-key-${account.id}`, async () => {
+        try {
+          await host.secrets.delete(secretKeyOf(account.id));
+          await host.service.request(SERVICE, 'keyChanged', { accountId: account.id });
+          say(t.keyRemoved);
+        } catch (error) { say(errorText(error)); }
+        await load();
+      })));
+  }
+  const check = state!.checks[account.id];
+  if (check) item.append(checkLine(check, account));
+  return item;
+}
+
+function addForm(): HTMLElement {
+  const box = el('div', { className: 'add' });
+  const preset = el('select', { name: 'preset' });
+  for (const entry of PRESETS) preset.append(el('option', { value: entry.id, textContent: entry.label }));
+  const label = el('input', { name: 'label', placeholder: t.name });
+  const url = el('input', { name: 'url', placeholder: 'https://…' });
+  const model = el('input', { name: 'model', placeholder: t.model });
+  const responses = el('input', { type: 'checkbox', name: 'responses' });
+  const responsesLabel = el('label', { className: 'check' }, responses, ` ${t.responses}`);
+  const agentsSlot = el('span');
+  let agents = agentBoxes('new', { preset: 'ollama-local' }, []);
+  const sync = (): void => {
+    const chosen = PRESETS.find(entry => entry.id === preset.value)!;
+    url.value = chosen.baseUrl ?? '';
+    url.disabled = chosen.id === 'ollama-cloud';
+    model.value = chosen.model;
+    label.value = chosen.id.startsWith('custom') ? '' : chosen.label.split(' · ')[0]!;
+    responsesLabel.hidden = chosen.protocol !== 'openai';
+    const shape = { preset: chosen.id, responsesApi: responses.checked };
+    agents = agentBoxes('new', shape, HARNESSES.filter(harness => harnessSupport(harness, shape).ok));
+    agentsSlot.replaceChildren(agents.node);
+  };
+  preset.addEventListener('change', sync);
+  responses.addEventListener('change', () => {
+    const shape = { preset: preset.value as PresetId, responsesApi: responses.checked };
+    agents = agentBoxes('new', shape, HARNESSES.filter(harness => harnessSupport(harness, shape).ok));
+    agentsSlot.replaceChildren(agents.node);
+  });
+  sync();
+  box.append(
+    el('div', { className: 'row' }, field(t.provider, preset), field(t.name, label)),
+    el('div', { className: 'row' }, field(t.address, url), field(t.model, model), responsesLabel),
+    el('div', { className: 'row' }, el('span', { className: 'label', textContent: t.agents }), agentsSlot),
+    el('div', { className: 'row' }, button(t.add, 'add', () => {
+      const chosen = PRESETS.find(entry => entry.id === preset.value)!;
+      const name = label.value.trim() || `${chosen.label} · ${model.value.trim()}`;
+      const id = newAccountId(`${name}-${model.value}`, new Set(state!.settings.accounts.map(account => account.id)));
+      const account: Account = { id, label: name, preset: chosen.id, baseUrl: url.value.trim(), model: model.value.trim(), agents: agents.value(),
+        ...(chosen.protocol === 'openai' && responses.checked ? { responsesApi: true } : {}) };
+      void saveAccounts(accounts => [...accounts, account]);
+    })));
+  return box;
+}
+
+function render(): void {
+  if (!state) return;
+  const list = el('ul', { className: 'accounts' });
+  if (!state.settings.accounts.length) list.append(el('li', { className: 'muted', textContent: t.none }));
+  for (const account of state.settings.accounts) list.append(accountItem(account));
+  root.replaceChildren(
+    el('h1', { textContent: t.title }),
+    el('p', { className: 'muted', textContent: t.lead }),
+    list,
+    el('h2', { textContent: t.add }),
+    addForm(),
+    el('p', { className: 'muted', textContent: t.keyWriteOnly })
+  );
+}
+
+host.onContext(({ appearance }) => {
+  locale = appearance.locale === 'ru' ? 'ru' : 'en';
+  t = STRINGS[locale];
+  document.documentElement.lang = locale;
+  render();
+});
+load().catch(error => say(errorText(error)));

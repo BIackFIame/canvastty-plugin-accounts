@@ -1,0 +1,17 @@
+{
+  "name": "canvastty-plugin-accounts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CanvasTTY plugin: model accounts — any agent CLI on any model (Ollama, Ollama Cloud, Z.AI, MiniMax, OpenRouter, compatible APIs), reasoning effort per launch, and account routes for orchestrators.",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --no-warnings --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  }
+}

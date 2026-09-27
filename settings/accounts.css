@@ -1,0 +1,19 @@
+:root { color-scheme: light dark; font: 13px/1.4 system-ui, sans-serif; }
+body { margin: 0; padding: 12px 16px 44px; }
+h1 { font-size: 15px; margin: 0 0 4px; }
+h2 { font-size: 13px; margin: 16px 0 6px; }
+.muted { opacity: 0.75; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+.label { min-width: 70px; }
+.field { display: inline-flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.check { display: inline-block; margin-right: 8px; }
+.agents { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+select, input, button { font: inherit; }
+input:not([type]), input[type="password"] { padding: 3px 6px; min-width: 160px; }
+.accounts { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 8px; }
+.account { padding: 6px 8px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: 6px; }
+.add { padding: 6px 8px; border: 1px dashed color-mix(in srgb, currentColor 25%, transparent); border-radius: 6px; }
+.check-result { margin-top: 4px; font-size: 12px; }
+.models { margin: 4px 0 0; padding-left: 16px; }
+.models code { font-size: 12px; }
+.status { position: fixed; left: 0; right: 0; bottom: 0; padding: 6px 16px; min-height: 1.4em; background: Canvas; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
