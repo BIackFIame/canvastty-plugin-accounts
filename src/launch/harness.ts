@@ -14,8 +14,7 @@
  * CTTY_MODEL_API_KEY named by Codex's env_key and OpenCode's {env:…}. Kimi with a key is the exception: its config file
  * carries the key, so the service reads it (the value is masked for agents) and hands it over as a private run file.
  *
- * Recipes follow `ollama launch` v0.34.4 without its persistent writes; verified live against claude 2.1.281 and
- * codex-cli 0.156.1 (qwen and kimi were not installed where this was written).
+ * Recipes follow `ollama launch` v0.34.4 without its persistent writes.
  */
 import type { Harness, OllamaShape, Protocol } from '../shared/accounts.ts';
 
