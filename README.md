@@ -1,5 +1,7 @@
 # CanvasTTY Accounts
 
+> **Status: preview.** This plugin needs CanvasTTY plugin API v2 (plugin services, launch contributors, session environments, decision hooks, plugin tools and card actions). Those extension points are proposed upstream and are not in a released CanvasTTY yet, so installing it on a current release fails the manifest check.
+
 [Русский](README.ru.md)
 
 Any agent on any model. Run **Claude Code, Codex, OpenCode, Qwen Code or Kimi** on a model of your choice — a local
