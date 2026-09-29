@@ -56,6 +56,8 @@ export class AccountsService {
   private readonly dataDir: string;
   private readonly transport: OllamaFetch | undefined;
   private readonly checks = new Map<string, CheckResult | { error: string }>();
+  /** Bumped whenever an account's check result is dropped (edited, removed, new key): a check started before it is stale. */
+  private readonly checkEpochs = new Map<string, number>();
 
   constructor(options: { host: Host; dataDir: string; saved?: unknown; transport?: OllamaFetch }) {
     this.host = options.host;
@@ -68,6 +70,11 @@ export class AccountsService {
   }
 
   private find(id: unknown): Account | undefined { return this.settings.accounts.find(account => account.id === id); }
+
+  private forgetCheck(id: string): void {
+    this.checks.delete(id);
+    this.checkEpochs.set(id, (this.checkEpochs.get(id) ?? 0) + 1);
+  }
 
   private async persist(): Promise<void> {
     await this.host.callHost('storage.set', { key: STORAGE_KEY, value: { settings: this.settings, keyOrigins: this.keyOrigins } satisfies Stored });
@@ -102,13 +109,13 @@ export class AccountsService {
       const kept = next.accounts.find(entry => entry.id === id);
       if (!kept) {
         delete this.keyOrigins[id];
-        this.checks.delete(id);
+        this.forgetCheck(id);
         await removeHomes(this.dataDir, id).catch(() => undefined);
       } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
         // A key is never sent to an address it was not saved for: the person saves it again.
         delete this.keyOrigins[id];
-        this.checks.delete(id);
-      } else if (kept.model !== account.model) this.checks.delete(id);
+        this.forgetCheck(id);
+      } else if (kept.model !== account.model) this.forgetCheck(id);
     }
     this.settings = next;
     await this.persist();
@@ -121,7 +128,7 @@ export class AccountsService {
     if (!account) throw new Error('No such account.');
     if (await this.readKey(account)) this.keyOrigins[account.id] = originOf(account.baseUrl);
     else delete this.keyOrigins[account.id];
-    this.checks.delete(account.id);
+    this.forgetCheck(account.id);
     await this.persist();
     return null;
   }
@@ -133,6 +140,7 @@ export class AccountsService {
   async check(accountId: unknown): Promise<CheckResult | { error: string }> {
     const account = this.find(accountId);
     if (!account) throw new Error('No such account.');
+    const epoch = this.checkEpochs.get(account.id) ?? 0;
     let result: CheckResult | { error: string };
     try {
       const shape = ollamaShapeOf(account);
@@ -155,7 +163,8 @@ export class AccountsService {
     } catch (error) {
       result = { error: errorText(error) };
     }
-    this.checks.set(account.id, result);
+    // Kept for the page only if the account is still the one that was checked.
+    if ((this.checkEpochs.get(account.id) ?? 0) === epoch && this.find(account.id)) this.checks.set(account.id, result);
     return result;
   }
 
@@ -284,7 +293,12 @@ export class AccountsService {
     const model = text(input.model, 100);
     const effort = text(input.effort, 20);
     if (name === 'list_routes') {
-      const routes = await listRoutes(this.settings.accounts, this.facts(), { ...(provider ? { provider } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      let routes;
+      try {
+        routes = await listRoutes(this.settings.accounts, this.facts(), { ...(provider ? { provider } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+      } catch (error) {
+        return { content: errorText(error), isError: true };
+      }
       return { content: {
         routes,
         signIn: 'Each agent\'s own CLI sign-in is not listed here: spawn_agent without launchOptions uses it, and CanvasTTY reports when it does not work.',

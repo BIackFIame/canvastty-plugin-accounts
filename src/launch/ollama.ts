@@ -157,6 +157,22 @@ export interface OllamaPreflight {
 const RUNTIME_MIN_VERSION: Partial<Record<Harness, string>> = { claude: OLLAMA_MIN_MESSAGES, codex: OLLAMA_MIN_RESPONSES };
 
 /**
+ * Why an Ollama server of `version` cannot run `harness` on an account of this shape, or null. One rule for the launch
+ * preflight and for the routes orchestrators see, so a route is never "ready" for a launch that would be refused.
+ */
+export function ollamaVersionRefusal(shape: OllamaShape, harness: Harness, version: string | null): string | null {
+  if (shape === 'cloud-direct') return null;
+  if (compareVersions(version, OLLAMA_MIN_LOCAL_PIN) < 0) {
+    return shape === 'cloud-local'
+      ? `Ollama ${version ?? 'of unknown version'} is too old for cloud models without a pulled stub; update Ollama to ${OLLAMA_MIN_LOCAL_PIN} or later.`
+      : `Ollama ${version ?? 'of unknown version'} cannot pin a model to this computer; update Ollama to ${OLLAMA_MIN_LOCAL_PIN} or later.`;
+  }
+  const minimum = shape === 'local' ? RUNTIME_MIN_VERSION[harness] : undefined;
+  if (minimum && compareVersions(version, minimum) < 0) return `${harness} needs Ollama ${minimum} or later.`;
+  return null;
+}
+
+/**
  * Checks one agent launch on an Ollama account before anything spawns (L22 preflight); refusals are plain sentences
  * for the card. The local account needs ≥ 0.18.0 (the server enforces `:local`), the model installed and local by
  * every check, and `tools` for an agent.
@@ -174,16 +190,16 @@ export async function preflightOllama(input: { baseUrl: string; shape: OllamaSha
     const version = await http('GET', '/api/version');
     if (version.status === 0) throw new Error('Ollama is not running. Open Ollama or run `ollama serve`.');
     const text = isRecord(version.json) ? shortText(version.json.version, 64) : null;
-    if (compareVersions(text, OLLAMA_MIN_LOCAL_PIN) < 0) throw new Error(`Ollama ${text ?? 'of unknown version'} is too old for cloud models without a pulled stub; update Ollama to ${OLLAMA_MIN_LOCAL_PIN} or later.`);
+    const old = ollamaVersionRefusal('cloud-local', input.harness, text);
+    if (old) throw new Error(old);
     const status = await http('GET', '/api/status');
     const cloud = status.status === 200 && isRecord(status.json) && isRecord(status.json.cloud) ? status.json.cloud : null;
     if (cloud?.disabled === true) throw new Error('Ollama Cloud is turned off on this server (OLLAMA_NO_CLOUD or disable_ollama_cloud).');
     return { wireModel: wire.model, cloudFeatures: true, contextWindow: null, note: null };
   }
   const probe = await probeModel(http, parseOllamaModelRef(input.model).base);
-  const minimum = RUNTIME_MIN_VERSION[input.harness];
-  if (!probe.localPin) throw new Error(`Ollama ${probe.version ?? 'of unknown version'} cannot pin a model to this computer; update Ollama to ${OLLAMA_MIN_LOCAL_PIN} or later.`);
-  if (minimum && compareVersions(probe.version, minimum) < 0) throw new Error(`${input.harness} needs Ollama ${minimum} or later.`);
+  const old = ollamaVersionRefusal('local', input.harness, probe.version);
+  if (old) throw new Error(old);
   if (!probe.installed) throw new Error(`Model ${input.model} is not installed in Ollama. Run \`ollama pull ${parseOllamaModelRef(input.model).base}\` yourself, then try again.`);
   if (probe.locality !== 'local') throw new Error(`Model ${input.model} is served by Ollama Cloud (a pulled cloud model), not by this computer.`);
   const capabilities = probe.capabilities ?? [];

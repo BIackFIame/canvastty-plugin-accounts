@@ -2,11 +2,13 @@
 // contribution per account, the refusals, «Проверить», the key's address binding and the orchestrator tools.
 // Keys are assembled at runtime; nothing leaves 127.0.0.1.
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { AccountsService, thirdPartyModel } from '../src/service/accounts.ts';
+import { seedClaudeHome } from '../src/launch/homes.ts';
+import { listRoutes } from '../src/routes/routes.ts';
 import { startFakeOllama } from './helpers/fake-ollama.mjs';
 
 const KEY = ['sk', 'fixture', 'glm', 'f00dfeed'.repeat(4)].join('-');
@@ -211,4 +213,77 @@ test('orchestrator tools: list_routes says what is ready and why not; pick_accou
   const down = await service.tool('pick_account', { provider: 'codex' });
   assert.match(down.content, /Qwen local \(qwen3\.5:9b\): Ollama is not running/);
   assert.equal((await service.tool('pick_account', {})).isError, true);
+});
+
+test('orchestrator tools: a route on an Ollama too old for the launch is not ready, with the launch\'s own reason', async (t) => {
+  const { service, context } = await fixture(t, { ollama: { version: '0.17.2' } });
+  const listed = (await service.tool('list_routes', { provider: 'claude' })).content;
+  const row = listed.routes.find(entry => entry.accountId === 'qwen-local');
+  assert.equal(row.state, 'ollama-old');
+  const refused = await service.prepare(context());
+  assert.equal(refused.refuse.reason, row.reason);
+  assert.equal(row.launchOptions, undefined);
+});
+
+test('orchestrator tools: list_routes checks the effort like pick_account does', async (t) => {
+  const { service } = await fixture(t);
+  const listed = (await service.tool('list_routes', { effort: 'max' })).content.routes;
+  assert.deepEqual(listed.filter(row => row.accountId === 'qwen-local').map(row => [row.provider, row.state]), [['claude', 'ready'], ['codex', 'no-effort'], ['opencode', 'no-effort']]);
+  assert.equal(listed.find(row => row.provider === 'claude').launchOptions['canvastty-accounts'].effort, 'max');
+  const unknown = await service.tool('list_routes', { effort: 'extreme' });
+  assert.equal(unknown.isError, true);
+  assert.match(unknown.content, /no reasoning effort "extreme"/);
+  assert.match((await service.tool('pick_account', { provider: 'claude', effort: 'extreme' })).content, /no reasoning effort "extreme"/);
+});
+
+test('routes: accounts are probed a few at a time, in order, and one no agent asked for is not probed', async () => {
+  const accounts = Array.from({ length: 9 }, (_, i) => ({ id: `a${i}`, label: `A${i}`, preset: 'zai-anthropic', baseUrl: 'https://api.z.ai/api/anthropic', model: 'glm-4.6', agents: [i === 8 ? 'opencode' : 'claude'] }));
+  let active = 0, most = 0;
+  const asked = [];
+  const facts = {
+    key: async account => { asked.push(account.id); active++; most = Math.max(most, active); await new Promise(resolve => setTimeout(resolve, 5)); active--; return 'ok'; },
+    ollama: async () => { throw new Error('not used'); }
+  };
+  const rows = await listRoutes(accounts, facts, { provider: 'claude' });
+  assert.deepEqual(rows.map(row => row.accountId), accounts.slice(0, 8).map(account => account.id));
+  assert.equal(asked.includes('a8'), false);
+  assert.ok(most > 1 && most <= 4, `at most four at once (${most})`);
+});
+
+test('«Проверить» that finishes after its account changed does not show its old result', async (t) => {
+  const ollama = await startFakeOllama();
+  t.after(() => ollama.close());
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const dataDir = await mkdtemp(join(tmpdir(), 'canvastty-accounts-check-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const storage = {};
+  const host = { callHost: async (method, params) => { if (method === 'storage.set') { storage[params.key] = params.value; return null; } return null; }, log() {}, emit() {} };
+  const service = new AccountsService({ host, dataDir, transport: async (url, init) => { await gate; return fetch(url, init); } });
+  const account = { id: 'local', label: 'Local', preset: 'ollama-local', baseUrl: ollama.url, model: 'qwen3.5:9b', agents: ['claude'] };
+  await service.save({ version: 1, accounts: [account] });
+  const checking = service.check('local');
+  await service.save({ version: 1, accounts: [{ ...account, model: 'gemma3:12b' }] });
+  release();
+  assert.equal((await checking).kind, 'ollama');
+  assert.deepEqual((await service.state()).checks, {}, 'the result was for the old model');
+});
+
+test('the account\'s Claude settings: a missing file is seeded, a broken one is kept aside, an unreadable one is not replaced', async (t) => {
+  const home = await mkdtemp(join(tmpdir(), 'canvastty-accounts-home-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const path = join(home, '.claude.json');
+  await seedClaudeHome(home, []);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).hasCompletedOnboarding, true);
+  await writeFile(path, '{"projects": {', { mode: 0o600 });
+  await seedClaudeHome(home, []);
+  assert.equal(await readFile(`${path}.unreadable`, 'utf8'), '{"projects": {');
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).hasCompletedOnboarding, true);
+  if (process.getuid?.() !== 0) {
+    await writeFile(path, '{"keep": true}', { mode: 0o600 });
+    await chmod(path, 0o000);
+    await assert.rejects(seedClaudeHome(home, [home]), /cannot be read/);
+    await chmod(path, 0o600);
+    assert.equal(await readFile(path, 'utf8'), '{"keep": true}');
+  }
 });

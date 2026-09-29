@@ -4,21 +4,23 @@
  * (folder trust, Codex's "Hooks need review") and keeps its conversations, which lets CanvasTTY continue a restored card.
  * The person's own sign-in never lives here, so it is never sent to the account's endpoint.
  */
-import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmod, copyFile, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join } from 'node:path';
 
 export const homeFolder = (dataDir: string, harness: 'claude' | 'codex', accountId: string): string => join(dataDir, 'homes', `${harness}-${accountId}`);
 
 /** The provider id inside Codex/OpenCode config for an account (stable, TOML-bare, not the account's name). */
 export const providerIdOf = (accountId: string): string => `canvastty_${createHash('sha256').update(accountId).digest('hex').slice(0, 12)}`;
 
-/** Creates the home (0700) and refuses a symlink or a file in its place. */
+/** Creates the home and the homes folder above it (both 0700) and refuses a symlink or a file in either place. */
 export async function ensureHome(path: string): Promise<string> {
   await mkdir(path, { recursive: true, mode: 0o700 });
-  const info = await lstat(path);
-  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('The account\'s agent home is not a folder.');
-  await chmod(path, 0o700);
+  for (const folder of [dirname(path), path]) {
+    const info = await lstat(folder);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error('The account\'s agent home is not a folder.');
+    await chmod(folder, 0o700);
+  }
   return path;
 }
 
@@ -30,10 +32,18 @@ export async function ensureHome(path: string): Promise<string> {
 export async function seedClaudeHome(home: string, trustedFolders: readonly string[]): Promise<void> {
   const path = join(home, '.claude.json');
   let current: Record<string, unknown> = {};
-  try {
-    const parsed: unknown = JSON.parse(await readFile(path, 'utf8'));
+  let text: string | null = null;
+  try { text = await readFile(path, 'utf8'); } catch (error) {
+    // Only a missing file is a first run; one that cannot be read is not replaced.
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('The account\'s Claude Code settings (.claude.json) cannot be read.');
+  }
+  if (text !== null) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(text); } catch { parsed = undefined; }
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) current = parsed as Record<string, unknown>;
-  } catch { /* first run, or unreadable: start from the seed */ }
+    // Not a settings object: keep a copy for the person before starting again from the seed.
+    else await copyFile(path, `${path}.unreadable`);
+  }
   const projects = current.projects && typeof current.projects === 'object' && !Array.isArray(current.projects) ? { ...current.projects as Record<string, unknown> } : {};
   let changed = current.hasCompletedOnboarding !== true;
   for (const folder of trustedFolders.filter(entry => isAbsolute(entry))) {
@@ -44,7 +54,7 @@ export async function seedClaudeHome(home: string, trustedFolders: readonly stri
   }
   if (!changed) return;
   const next = { ...current, hasCompletedOnboarding: true, ...(Object.keys(projects).length ? { projects } : {}) };
-  const temporary = `${path}.${process.pid}.tmp`;
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temporary, JSON.stringify(next), { mode: 0o600 });
   await rename(temporary, path);
 }

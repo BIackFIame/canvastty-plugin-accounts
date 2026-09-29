@@ -165,18 +165,23 @@
     state = await host.service.request(SERVICE, "state");
     render();
   }
-  async function saveAccounts(change) {
-    if (!state) return false;
-    const accounts = change(structuredClone(state.settings.accounts));
-    try {
-      await host.service.request(SERVICE, "save", { settings: { version: 1, accounts } });
-      say(t.saved);
-      await load();
-      return true;
-    } catch (error) {
-      say(`${t.notSaved}${errorText(error)}`);
-      return false;
-    }
+  var saving = Promise.resolve();
+  function saveAccounts(change) {
+    const run = saving.then(async () => {
+      if (!state) return false;
+      const accounts = change(structuredClone(state.settings.accounts));
+      try {
+        await host.service.request(SERVICE, "save", { settings: { version: 1, accounts } });
+        say(t.saved);
+        await load().catch((error) => say(errorText(error)));
+        return true;
+      } catch (error) {
+        say(`${t.notSaved}${errorText(error)}`);
+        return false;
+      }
+    });
+    saving = run;
+    return run;
   }
   function agentBoxes(prefix, account, chosen) {
     const inputs = /* @__PURE__ */ new Map();
@@ -249,8 +254,8 @@
         }, (error) => say(errorText(error)));
       }),
       button(t.remove, `remove-${account.id}`, async () => {
-        if (accountKeyed(account)) await host.secrets.delete(secretKeyOf(account.id)).catch(() => void 0);
-        await saveAccounts((accounts) => accounts.filter((entry) => entry.id !== account.id));
+        if (!await saveAccounts((accounts) => accounts.filter((entry) => entry.id !== account.id))) return;
+        if (accountKeyed(account)) await host.secrets.delete(secretKeyOf(account.id)).catch((error) => say(errorText(error)));
       })
     ));
     if (accountKeyed(account)) {
@@ -263,21 +268,24 @@
         input,
         button(t.saveKey, `save-key-${account.id}`, async () => {
           const value = input.value.trim();
-          input.value = "";
           if (!value) return;
           const problem = apiKeyProblem(value);
           if (problem) {
+            input.value = "";
             say(KEY_PROBLEM[locale][problem] ?? problem);
             return;
           }
+          let stored = false;
           try {
             await host.secrets.set(secretKeyOf(account.id), value);
+            stored = true;
+            input.value = "";
             await host.service.request(SERVICE, "keyChanged", { accountId: account.id });
             say(t.keySaved);
           } catch (error) {
             say(`${t.notSaved}${errorText(error)}`);
           }
-          await load();
+          if (stored) await load();
         }),
         button(t.removeKey, `remove-key-${account.id}`, async () => {
           try {
