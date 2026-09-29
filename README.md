@@ -18,7 +18,12 @@ Ollama model, Ollama Cloud, Z.AI, MiniMax, OpenRouter or any Anthropic- or OpenA
 
 Orchestrators get two tools: `canvastty-accounts__list_routes` (every account × agent, ready or why not) and
 `canvastty-accounts__pick_account` (the first ready account for an agent, skipping ones that cannot work now). Both
-answer with `launchOptions` to pass to `spawn_agent`.
+answer with `launchOptions` to pass to `spawn_agent`. The plugin declares its launch options `delegable`: an
+orchestrator's choice changes only the model, its endpoint and the reasoning effort. *I trust this folder* (a Codex
+`-c projects=…` trust or the account home's trust entry) is ignored for a subagent, the configs it writes (OpenCode,
+Kimi, Codex `-c`) set no approval, permission or sandbox keys, and CanvasTTY
+still applies the subagent's own profile, hooks and isolation layer. An account run uses the account's own Claude/Codex
+home, so the person's `~/.claude` or `~/.codex` settings (their own allow or deny rules) are not read there.
 
 ## What it does to a launch
 

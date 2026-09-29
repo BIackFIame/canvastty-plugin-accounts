@@ -23,6 +23,12 @@ export const MODEL_KEY_ENV = 'CTTY_MODEL_API_KEY';
 export const OLLAMA_PLACEHOLDER_KEY = 'ollama';
 /** Replaced by CanvasTTY with this run's folder of `files`. */
 export const LAUNCH_FILES = '{launchFiles}';
+/**
+ * CanvasTTY refuses an OpenCode or Kimi configuration with a key like these anywhere in it (they decide approvals,
+ * which only the person's profile does; LaunchPipeline PERMISSION_CONFIG_KEY). The configs built here set none; the
+ * one key that comes from the account is OpenCode's model name, so such a name is refused here with a clear reason.
+ */
+export const APPROVAL_CONFIG_KEY = /permission|approv|yolo|sandbox|dangerous|bypass|auto_?accept|trust/i;
 const CODEX_FALLBACK_CONTEXT = 128_000;
 const KIMI_FALLBACK_CONTEXT = 32_768;
 
@@ -189,6 +195,9 @@ function codexPlan(input: HarnessInput, context: number | null): Contribution {
  * APIs (L28). The key is `{env:CTTY_MODEL_API_KEY}`, substituted by OpenCode as raw text (see apiKeyHygiene).
  */
 function openCodePlan(input: HarnessInput, context: number | null): Contribution {
+  if (APPROVAL_CONFIG_KEY.test(input.model) || APPROVAL_CONFIG_KEY.test(input.providerId)) {
+    throw new Error(`OpenCode cannot run the model ${input.model.slice(0, 60)} from an account: its name would be a key CanvasTTY reserves for approval settings.`);
+  }
   const npm = input.protocol === 'anthropic' ? '@ai-sdk/anthropic' : '@ai-sdk/openai-compatible';
   const baseURL = input.protocol === 'anthropic' ? openCodeAnthropicBase(input.baseUrl) : openAiBase(input);
   const provider = {

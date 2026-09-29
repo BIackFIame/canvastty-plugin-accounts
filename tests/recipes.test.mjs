@@ -1,7 +1,7 @@
 // L22 recipes (pure) and the account model: what each agent CLI receives for one account, and which accounts are valid.
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildHarnessLaunch, codexTrustArguments, MODEL_KEY_ENV, openCodeAnthropicBase } from '../src/launch/harness.ts';
+import { APPROVAL_CONFIG_KEY, buildHarnessLaunch, codexTrustArguments, MODEL_KEY_ENV, openCodeAnthropicBase } from '../src/launch/harness.ts';
 import { effortArguments } from '../src/launch/effort.ts';
 import {
   accountKeyed, harnessSupport, loadSettings, newAccountId, normalizeOllamaServerUrl, ollamaWireModel, supportedHarnesses, validateAccount, validateSettings
@@ -108,6 +108,47 @@ test('Qwen Code and Kimi: OPENAI_* or an openai_legacy alias; Kimi\'s key only i
   assert.ok(!keyedKimi.args.join(' ').includes(key));
   assert.equal(JSON.parse(keyedKimi.files[0].content).providers.canvastty.api_key, key);
   assert.throws(() => buildHarnessLaunch({ ...base, harness: 'kimi', protocol: 'openai', baseUrl: 'https://api.moonshot.ai/v1', model: 'kimi-k2', secretKey: SECRET }), /Kimi needs the account key/);
+});
+
+/** A key anywhere in a config object that CanvasTTY's launch check (LaunchPipeline permissionConfigProblem) refuses. */
+function approvalKey(value, depth = 0) {
+  if (depth > 8 || !value || typeof value !== 'object') return null;
+  for (const [key, entry] of Object.entries(value)) {
+    if (APPROVAL_CONFIG_KEY.test(key)) return key;
+    const nested = approvalKey(entry, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+test('no generated OpenCode, Kimi or Codex configuration carries an approval, permission or sandbox key', () => {
+  // The same pattern as CanvasTTY's PERMISSION_CONFIG_KEY (core LaunchPipeline.ts).
+  assert.equal(String(APPROVAL_CONFIG_KEY), String(/permission|approv|yolo|sandbox|dangerous|bypass|auto_?accept|trust/i));
+  const shapes = [
+    { protocol: 'ollama', ollamaShape: 'local', baseUrl: 'http://127.0.0.1:11434', model: 'qwen3.5:9b:local', contextWindow: 65536 },
+    { protocol: 'ollama', ollamaShape: 'cloud-direct', baseUrl: 'https://ollama.com', model: 'glm-4.6', secretKey: SECRET, keyValue: 'fixture-key' },
+    { protocol: 'openai', baseUrl: 'https://api.z.ai/api/paas/v4', model: 'glm-4.6', secretKey: SECRET, keyValue: 'fixture-key' },
+    { protocol: 'anthropic', baseUrl: 'https://api.minimax.io/anthropic', model: 'MiniMax-M2', secretKey: SECRET, keyValue: 'fixture-key' }
+  ];
+  for (const shape of shapes) {
+    const opencode = buildHarnessLaunch({ ...base, harness: 'opencode', ...shape });
+    assert.deepEqual(Object.keys(opencode.env), ['OPENCODE_CONFIG'], 'no OPENCODE_PERMISSION or OPENCODE_CONFIG_DIR');
+    assert.equal(approvalKey(JSON.parse(opencode.files[0].content)), null, `opencode ${shape.protocol}`);
+    if (shape.protocol !== 'anthropic') {
+      const kimi = buildHarnessLaunch({ ...base, harness: 'kimi', ...shape });
+      const inline = kimi.args[0] === '--config' ? kimi.args[1] : kimi.files[0].content;
+      assert.equal(approvalKey(JSON.parse(inline)), null, `kimi ${shape.protocol}`);
+    }
+    if (shape.protocol !== 'anthropic') {
+      const codex = buildHarnessLaunch({ ...base, harness: 'codex', ...shape, protocol: shape.protocol === 'openai' ? 'openai' : shape.protocol });
+      const keys = codex.args.flatMap((arg, index) => (codex.args[index - 1] === '-c' ? [arg.split('=', 1)[0]] : []));
+      assert.ok(keys.length > 0 && keys.every((key) => !APPROVAL_CONFIG_KEY.test(key)), `codex ${keys}`);
+    }
+  }
+  // Folder trust reaches Codex only when the person trusted the folder for this launch (a subagent never does).
+  assert.ok(!buildHarnessLaunch({ ...base, harness: 'codex', ...shapes[0] }).args.some((arg) => arg.startsWith('projects=')));
+  // The one key that comes from the account (OpenCode's model name) is refused before CanvasTTY would refuse the file.
+  assert.throws(() => buildHarnessLaunch({ ...base, harness: 'opencode', ...shapes[0], model: 'sandbox-coder:7b' }), /reserves for approval settings/);
 });
 
 test('a keyed account never builds without its key; Ollama needs its checked shape', () => {

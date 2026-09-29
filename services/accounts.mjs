@@ -371,6 +371,7 @@ function loadSettings(value) {
 var MODEL_KEY_ENV = "CTTY_MODEL_API_KEY";
 var OLLAMA_PLACEHOLDER_KEY = "ollama";
 var LAUNCH_FILES = "{launchFiles}";
+var APPROVAL_CONFIG_KEY = /permission|approv|yolo|sandbox|dangerous|bypass|auto_?accept|trust/i;
 var CODEX_FALLBACK_CONTEXT = 128e3;
 var KIMI_FALLBACK_CONTEXT = 32768;
 var toml = (value) => JSON.stringify(value);
@@ -492,6 +493,9 @@ function codexPlan(input, context) {
   };
 }
 function openCodePlan(input, context) {
+  if (APPROVAL_CONFIG_KEY.test(input.model) || APPROVAL_CONFIG_KEY.test(input.providerId)) {
+    throw new Error(`OpenCode cannot run the model ${input.model.slice(0, 60)} from an account: its name would be a key CanvasTTY reserves for approval settings.`);
+  }
   const npm = input.protocol === "anthropic" ? "@ai-sdk/anthropic" : "@ai-sdk/openai-compatible";
   const baseURL = input.protocol === "anthropic" ? openCodeAnthropicBase(input.baseUrl) : openAiBase(input);
   const provider = {

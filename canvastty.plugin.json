@@ -15,18 +15,18 @@
   "coreFiles": [
     {
       "path": "README.md",
-      "bytes": 3927,
-      "sha256": "3fa497c0bef10c2c40e38f2ae23f73f47ef52fe338986b339a0ff435c3b630ef"
+      "bytes": 4523,
+      "sha256": "fdb6771f4adb3c74b685cbff21e7a3868e4cf760fc1234572263e656a8b912bf"
     },
     {
       "path": "README.ru.md",
-      "bytes": 5937,
-      "sha256": "02ae5409373ddf834cd969aa77a19683450d71864c708d359f1f4673b731f348"
+      "bytes": 6910,
+      "sha256": "26877464c1255f8a9658f676e98eea8127997e371add2aa933606da8bc1b5b87"
     },
     {
       "path": "services/accounts.mjs",
-      "bytes": 60457,
-      "sha256": "c7e8f67cbb73afa6065e507878a14b8fdb335491bf98cdbc96a6995d4e8df989"
+      "bytes": 60816,
+      "sha256": "0c157c572e78134dcd146462eebc8d841965259098eb377334ddee3f1e2851c4"
     },
     {
       "path": "settings/accounts.html",
@@ -115,7 +115,8 @@
             "kind": "boolean",
             "default": false
           }
-        ]
+        ],
+        "delegable": true
       },
       "tools": [
         {

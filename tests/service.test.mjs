@@ -97,6 +97,19 @@ test('an account model is third-party: CanvasTTY runs "auto" as accept-edits; th
   assert.equal(thirdPartyModel('claude', null), true);
 });
 
+test('delegated (an orchestrator chose the options): a subagent gets the account and effort, never folder trust or approval keys', async (t) => {
+  const { service, dataDir, context, project } = await fixture(t);
+  for (const provider of ['claude', 'codex', 'opencode']) {
+    const answer = await service.prepare(context({ provider, role: 'subagent', options: { trustFolder: true, effort: provider === 'opencode' ? 'default' : 'high' } }));
+    assert.equal(answer.refuse, undefined, provider);
+    assert.ok(!answer.args.some(arg => arg.startsWith('projects=')), `${provider}: no folder trust`);
+    assert.ok(!Object.keys(answer.env).some(name => /PERMISSION|CONFIG_DIR$/u.test(name) && name !== 'CLAUDE_CONFIG_DIR'), provider);
+    for (const file of answer.files) assert.doesNotMatch(Object.keys(JSON.parse(file.content)).join(), /permission|approv|yolo|sandbox|bypass|trust/i, provider);
+  }
+  const seeded = JSON.parse(await readFile(join(dataDir, 'homes', 'claude-qwen-local', '.claude.json'), 'utf8'));
+  assert.equal(seeded.projects?.[project], undefined, 'the account home does not trust the folder for a subagent');
+});
+
 test('a Claude subagent in the orchestrator\'s folder (CanvasTTY\'s trustedFolder) is trusted in the account home only', async (t) => {
   const { service, dataDir, context, project } = await fixture(t);
   const docs = join(project, 'docs');

@@ -30,6 +30,8 @@ test('the manifest\'s coreFiles match the package bytes, and the service and pag
     assert.doesNotMatch(readFileSync(join(root, path), 'utf8'), /^import .* from ["']\.\.?\//mu, `${path} is bundled`);
   }
   assert.equal(manifest.id, 'canvastty-accounts');
+  // Orchestrators pass list_routes / pick_account answers to spawn_agent: the options are declared safe to delegate.
+  assert.equal(manifest.services[0].launch.delegable, true);
   assert.ok(!manifest.permissions.includes('network'), 'a service needs no surface network permission');
 });
 
@@ -133,6 +135,8 @@ test('through CanvasTTY\'s own supervisor and launch pipeline: the launcher list
   assert.deepEqual(await pipeline.fieldOptions(checked.id, 'claude'), { account: [{ value: 'qwen', label: 'Qwen · qwen3.5:9b' }] });
   const options = pipeline.normalizeOptions('claude', { [checked.id]: { account: 'qwen' } });
   assert.deepEqual(options, { [checked.id]: { account: 'qwen', effort: 'default', trustFolder: false } });
+  // An orchestrator's spawn_agent launchOptions reach the plugin because it declared them delegable.
+  assert.deepEqual(pipeline.normalizeOptions('claude', { [checked.id]: { account: 'qwen' } }, { delegated: true }), options);
   const prepared = await pipeline.prepare({ sessionId: 'e2e', provider: 'claude', profile: 'normal', role: 'agent', cwd: project, restoring: false, resume: false, environment: null, options });
   assert.equal(prepared.ok, true, prepared.reason);
   assert.equal(prepared.env.ANTHROPIC_BASE_URL, ollama.url);
