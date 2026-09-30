@@ -59,14 +59,40 @@ export class AccountsService {
   /** Bumped whenever an account's check result is dropped (edited, removed, new key): a check started before it is stale. */
   private readonly checkEpochs = new Map<string, number>();
 
-  constructor(options: { host: Host; dataDir: string; saved?: unknown; transport?: OllamaFetch }) {
+  /** The first read of the storage failed: nothing is known yet, so nothing may be shown as the accounts or saved over them. */
+  private unread: boolean;
+  private loading: Promise<void> | null = null;
+  /** Saves and key bindings run one at a time, each against what the one before it persisted. */
+  private writes: Promise<unknown> = Promise.resolve();
+
+  /** `unread`: the storage could not be read at start (not the same as nothing saved yet). */
+  constructor(options: { host: Host; dataDir: string; saved?: unknown; unread?: boolean; transport?: OllamaFetch }) {
     this.host = options.host;
     this.dataDir = options.dataDir;
     this.transport = options.transport;
-    const saved = options.saved && typeof options.saved === 'object' ? options.saved as Partial<Stored> : {};
+    this.settings = loadSettings(undefined);
+    this.keyOrigins = {};
+    this.unread = options.unread === true;
+    if (!this.unread) this.apply(options.saved);
+  }
+
+  private apply(value: unknown): void {
+    const saved = value && typeof value === 'object' ? value as Partial<Stored> : {};
     this.settings = loadSettings(saved.settings);
     this.keyOrigins = {};
     for (const [id, origin] of Object.entries(saved.keyOrigins ?? {})) if (typeof origin === 'string' && this.find(id)) this.keyOrigins[id] = origin;
+  }
+
+  /**
+   * Reads the saved accounts again when the first read failed; while they still cannot be read every request fails
+   * instead of showing (and a save writing) an empty list over them.
+   */
+  async load(): Promise<void> {
+    if (!this.unread) return;
+    this.loading ??= this.host.callHost('storage.get', { key: STORAGE_KEY })
+      .then(saved => { this.apply(saved); this.unread = false; })
+      .finally(() => { this.loading = null; });
+    try { await this.loading; } catch { throw new Error('The saved accounts could not be read; nothing was changed. Try again.'); }
   }
 
   private find(id: unknown): Account | undefined { return this.settings.accounts.find(account => account.id === id); }
@@ -76,8 +102,16 @@ export class AccountsService {
     this.checkEpochs.set(id, (this.checkEpochs.get(id) ?? 0) + 1);
   }
 
-  private async persist(): Promise<void> {
-    await this.host.callHost('storage.set', { key: STORAGE_KEY, value: { settings: this.settings, keyOrigins: this.keyOrigins } satisfies Stored });
+  /** Writes `value`; the caller takes it into memory only once this resolved, so memory never shows what is not saved. */
+  private async persist(value: Stored): Promise<void> {
+    if (this.unread) throw new Error('The saved accounts could not be read; nothing was changed. Try again.');
+    await this.host.callHost('storage.set', { key: STORAGE_KEY, value: value satisfies Stored });
+  }
+
+  private serialized<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.writes.then(run, run);
+    this.writes = next.catch(() => undefined);
+    return next;
   }
 
   /** The key of a keyed account, read in this process only to check it (the value is masked for agents by CanvasTTY). */
@@ -95,42 +129,57 @@ export class AccountsService {
   // ---- the settings page ----
 
   async state(): Promise<{ settings: AccountsSettings; keys: Record<string, 'ok' | 'missing' | 'other-address' | 'none'>; checks: Record<string, CheckResult | { error: string }>; presets: typeof PRESETS }> {
+    // One secrets read per keyed account, all at once (MAX_ACCOUNTS stays under the transport's host-call cap).
+    const { settings } = this;
+    const states = await Promise.all(settings.accounts.map(account =>
+      accountKeyed(account) ? this.keyState(account).catch(() => 'missing' as const) : Promise.resolve('none' as const)));
     const keys: Record<string, 'ok' | 'missing' | 'other-address' | 'none'> = {};
-    for (const account of this.settings.accounts) {
-      keys[account.id] = accountKeyed(account) ? await this.keyState(account).catch(() => 'missing' as const) : 'none';
-    }
-    return { settings: this.settings, keys, checks: Object.fromEntries(this.checks), presets: PRESETS };
+    settings.accounts.forEach((account, i) => { keys[account.id] = states[i]!; });
+    return { settings, keys, checks: Object.fromEntries(this.checks), presets: PRESETS };
   }
 
   async save(value: unknown): Promise<{ saved: true }> {
     const next = validateSettings(value);
-    const previous = new Map(this.settings.accounts.map(account => [account.id, account]));
-    for (const [id, account] of previous) {
-      const kept = next.accounts.find(entry => entry.id === id);
-      if (!kept) {
-        delete this.keyOrigins[id];
-        this.forgetCheck(id);
-        await removeHomes(this.dataDir, id).catch(() => undefined);
-      } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
-        // A key is never sent to an address it was not saved for: the person saves it again.
-        delete this.keyOrigins[id];
-        this.forgetCheck(id);
-      } else if (kept.model !== account.model) this.forgetCheck(id);
-    }
-    this.settings = next;
-    await this.persist();
-    return { saved: true };
+    return this.serialized(async () => {
+      const keyOrigins = { ...this.keyOrigins };
+      const removed: string[] = [];
+      const changed: string[] = [];
+      for (const account of this.settings.accounts) {
+        const { id } = account;
+        const kept = next.accounts.find(entry => entry.id === id);
+        if (!kept) {
+          delete keyOrigins[id];
+          removed.push(id);
+        } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
+          // A key is never sent to an address it was not saved for: the person saves it again.
+          delete keyOrigins[id];
+          changed.push(id);
+        } else if (kept.model !== account.model) changed.push(id);
+      }
+      // Saved first: a failed write leaves memory (and the removed accounts' homes) as they were.
+      await this.persist({ settings: next, keyOrigins });
+      this.settings = next;
+      this.keyOrigins = keyOrigins;
+      for (const id of [...removed, ...changed]) this.forgetCheck(id);
+      for (const id of removed) await removeHomes(this.dataDir, id).catch(() => undefined);
+      return { saved: true as const };
+    });
   }
 
   /** The page saved or removed a key: bind it to the account's address as it is now. */
   async keyChanged(accountId: unknown): Promise<null> {
-    const account = this.find(accountId);
-    if (!account) throw new Error('No such account.');
-    if (await this.readKey(account)) this.keyOrigins[account.id] = originOf(account.baseUrl);
-    else delete this.keyOrigins[account.id];
-    this.forgetCheck(account.id);
-    await this.persist();
-    return null;
+    return this.serialized(async () => {
+      const account = this.find(accountId);
+      if (!account) throw new Error('No such account.');
+      const keyOrigins = { ...this.keyOrigins };
+      if (await this.readKey(account)) keyOrigins[account.id] = originOf(account.baseUrl);
+      else delete keyOrigins[account.id];
+      // The key itself already changed: its old check result is stale whether or not the binding is saved.
+      this.forgetCheck(account.id);
+      await this.persist({ settings: this.settings, keyOrigins });
+      this.keyOrigins = keyOrigins;
+      return null;
+    });
   }
 
   /**

@@ -144,3 +144,17 @@ test('through CanvasTTY\'s own supervisor and launch pipeline: the launcher list
   assert.ok(prepared.args.includes('--model'));
   await prepared.cleanup();
 });
+
+test('over JSON-RPC: a storage read that fails at start is retried, and nothing is saved over the accounts meanwhile', async (t) => {
+  const storage = { accounts: { settings: { version: 1, accounts: [{ id: 'qwen', label: 'Qwen', preset: 'ollama-local', baseUrl: 'http://127.0.0.1:11434', model: 'qwen3.5:9b', agents: ['claude'] }] }, keyOrigins: {} } };
+  const saved = structuredClone(storage.accounts);
+  let failures = 2;
+  const service = startService(t, { dataDir: join(base, 'data-unread'), host: {
+    'storage.get': ({ key }) => { if (failures-- > 0) throw new Error('host busy'); return storage[key] ?? null; },
+    'storage.set': ({ key, value }) => { storage[key] = value; },
+    'secrets.get': () => null
+  } });
+  await assert.rejects(service.request('save', { settings: { version: 1, accounts: [] } }), /could not be read/);
+  assert.deepEqual(storage.accounts, saved);
+  assert.deepEqual((await service.request('state')).settings.accounts.map(account => account.id), ['qwen']);
+});

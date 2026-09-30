@@ -8,7 +8,9 @@ var RPC_LIMITS = Object.freeze({
   hostCalls: 64,
   activeHandlers: 64,
   /** CanvasTTY waits 2 s after canvastty.shutdown before SIGTERM. */
-  drainMs: 1500
+  drainMs: 1500,
+  /** Events and logs held while the host is not reading, at most. */
+  outboundBytes: 8 * 1048576
 });
 function serve({ methods, notifications = {}, onInitialize, input = process.stdin, output = process.stdout, exit = (code) => process.exit(code), limits = {} }) {
   const limit = { ...RPC_LIMITS, ...limits };
@@ -18,9 +20,60 @@ function serve({ methods, notifications = {}, onInitialize, input = process.stdi
   let stopping = false;
   let hostGone = false;
   let onIdle = null;
-  const send = (message) => {
-    output.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}
-`);
+  const queue = [];
+  let held = 0;
+  let blocked = false;
+  let dropped = 0;
+  let onFlushed = null;
+  const write = (text) => {
+    if (output.write(text) === false && typeof output.once === "function") {
+      blocked = true;
+      output.once("drain", flush);
+    }
+  };
+  function flush() {
+    blocked = false;
+    while (queue.length && !blocked) {
+      const frame = queue.shift();
+      if (frame.droppable) held -= frame.bytes;
+      write(frame.text);
+    }
+    if (blocked) return;
+    if (dropped) {
+      const count = dropped;
+      dropped = 0;
+      send({ method: "log", params: { level: "warn", message: `Dropped ${count} events or logs while the host was not reading.` } }, true);
+    }
+    if (!blocked && !queue.length) onFlushed?.();
+  }
+  const send = (message, droppable = false) => {
+    const text = `${JSON.stringify({ jsonrpc: "2.0", ...message })}
+`;
+    const bytes = Buffer.byteLength(text);
+    if (bytes > limit.frameBytes && message.method !== "log") return false;
+    if (!blocked) {
+      write(text);
+      return true;
+    }
+    if (droppable) {
+      for (let at = 0; held + bytes > limit.outboundBytes && at < queue.length; ) {
+        const frame = queue[at];
+        if (!frame.droppable) {
+          at++;
+          continue;
+        }
+        held -= frame.bytes;
+        queue.splice(at, 1);
+        dropped++;
+      }
+      if (held + bytes > limit.outboundBytes) {
+        dropped++;
+        return true;
+      }
+      held += bytes;
+    }
+    queue.push({ text, bytes, droppable });
+    return true;
   };
   const host = {
     callHost: (method, params) => new Promise((resolve, reject) => {
@@ -38,10 +91,18 @@ function serve({ methods, notifications = {}, onInitialize, input = process.stdi
         reject(new Error(`The host did not answer ${method} in time.`));
       }, limit.hostCallMs);
       pending.set(id, { resolve, reject, timer });
-      send({ id, method, params });
+      if (!send({ id, method, params })) {
+        clearTimeout(timer);
+        pending.delete(id);
+        reject(new Error(`The ${method} request is larger than the frame limit.`));
+      }
     }),
-    log: (level, message) => send({ method: "log", params: { level, message: String(message).slice(0, 500) } }),
-    emit: (event, data) => send({ method: "event", params: { event, data } })
+    log: (level, message) => {
+      send({ method: "log", params: { level, message: String(message).slice(0, 500) } }, true);
+    },
+    emit: (event, data) => {
+      if (!send({ method: "event", params: { event, data } }, true)) host.log("warn", `Dropped a ${String(event).slice(0, 80)} event larger than the frame limit.`);
+    }
   };
   const record = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const errorText2 = (error) => error instanceof Error ? error.message : String(error);
@@ -55,10 +116,17 @@ function serve({ methods, notifications = {}, onInitialize, input = process.stdi
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    const timer = setTimeout(() => exit(0), limit.drainMs);
-    onIdle = () => {
+    let exited = false;
+    const finish = () => {
+      if (exited) return;
+      exited = true;
       clearTimeout(timer);
       exit(0);
+    };
+    const timer = setTimeout(finish, limit.drainMs);
+    onIdle = () => {
+      if (blocked || queue.length) onFlushed = finish;
+      else finish();
     };
     if (active === 0) onIdle();
   };
@@ -98,7 +166,9 @@ function serve({ methods, notifications = {}, onInitialize, input = process.stdi
         if (!handler) throw Object.assign(new Error(`Unknown method: ${method}`), { code: -32601 });
         return handler(record(message.params), host);
       }).then(
-        (result) => send({ id: message.id, result: result ?? null }),
+        (result) => {
+          if (!send({ id: message.id, result: result ?? null })) send({ id: message.id, error: { code: -32e3, message: "The answer is larger than the frame limit." } });
+        },
         (error2) => send({ id: message.id, error: { code: error2?.code ?? -32e3, message: errorText2(error2).slice(0, 400) } })
       );
       return;
@@ -629,6 +699,27 @@ function isRecord(value) {
 var positive = (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
 var shortText = (value, limit = 40) => typeof value === "string" && value.length > 0 && value.length <= limit && !/[\u0000-\u001f\u007f]/u.test(value) ? value : null;
 var remote = (entry) => typeof entry.remote_host === "string" && entry.remote_host.length > 0 || typeof entry.remote_model === "string" && entry.remote_model.length > 0;
+async function boundedText(response, limit) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel().catch(() => void 0);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 function ollamaHttp(baseUrl, transport = fetch, timeoutMs = 3e3) {
   return async (method, path, body) => {
     let response;
@@ -648,8 +739,8 @@ function ollamaHttp(baseUrl, transport = fetch, timeoutMs = 3e3) {
       await response.body?.cancel().catch(() => void 0);
       return { status: response.status, json: null };
     }
-    const text = await response.text().catch(() => "");
-    if (text.length > MAX_BODY) return { status: response.status, json: null };
+    const text = await boundedText(response, MAX_BODY);
+    if (text === null) return { status: response.status, json: null };
     try {
       return { status: response.status, json: text ? JSON.parse(text) : null };
     } catch {
@@ -886,14 +977,44 @@ var AccountsService = class {
   checks = /* @__PURE__ */ new Map();
   /** Bumped whenever an account's check result is dropped (edited, removed, new key): a check started before it is stale. */
   checkEpochs = /* @__PURE__ */ new Map();
+  /** The first read of the storage failed: nothing is known yet, so nothing may be shown as the accounts or saved over them. */
+  unread;
+  loading = null;
+  /** Saves and key bindings run one at a time, each against what the one before it persisted. */
+  writes = Promise.resolve();
+  /** `unread`: the storage could not be read at start (not the same as nothing saved yet). */
   constructor(options) {
     this.host = options.host;
     this.dataDir = options.dataDir;
     this.transport = options.transport;
-    const saved = options.saved && typeof options.saved === "object" ? options.saved : {};
+    this.settings = loadSettings(void 0);
+    this.keyOrigins = {};
+    this.unread = options.unread === true;
+    if (!this.unread) this.apply(options.saved);
+  }
+  apply(value) {
+    const saved = value && typeof value === "object" ? value : {};
     this.settings = loadSettings(saved.settings);
     this.keyOrigins = {};
     for (const [id, origin] of Object.entries(saved.keyOrigins ?? {})) if (typeof origin === "string" && this.find(id)) this.keyOrigins[id] = origin;
+  }
+  /**
+   * Reads the saved accounts again when the first read failed; while they still cannot be read every request fails
+   * instead of showing (and a save writing) an empty list over them.
+   */
+  async load() {
+    if (!this.unread) return;
+    this.loading ??= this.host.callHost("storage.get", { key: STORAGE_KEY }).then((saved) => {
+      this.apply(saved);
+      this.unread = false;
+    }).finally(() => {
+      this.loading = null;
+    });
+    try {
+      await this.loading;
+    } catch {
+      throw new Error("The saved accounts could not be read; nothing was changed. Try again.");
+    }
   }
   find(id) {
     return this.settings.accounts.find((account) => account.id === id);
@@ -902,8 +1023,15 @@ var AccountsService = class {
     this.checks.delete(id);
     this.checkEpochs.set(id, (this.checkEpochs.get(id) ?? 0) + 1);
   }
-  async persist() {
-    await this.host.callHost("storage.set", { key: STORAGE_KEY, value: { settings: this.settings, keyOrigins: this.keyOrigins } });
+  /** Writes `value`; the caller takes it into memory only once this resolved, so memory never shows what is not saved. */
+  async persist(value) {
+    if (this.unread) throw new Error("The saved accounts could not be read; nothing was changed. Try again.");
+    await this.host.callHost("storage.set", { key: STORAGE_KEY, value });
+  }
+  serialized(run) {
+    const next = this.writes.then(run, run);
+    this.writes = next.catch(() => void 0);
+    return next;
   }
   /** The key of a keyed account, read in this process only to check it (the value is masked for agents by CanvasTTY). */
   async readKey(account) {
@@ -921,39 +1049,52 @@ var AccountsService = class {
   }
   // ---- the settings page ----
   async state() {
+    const { settings } = this;
+    const states = await Promise.all(settings.accounts.map((account) => accountKeyed(account) ? this.keyState(account).catch(() => "missing") : Promise.resolve("none")));
     const keys = {};
-    for (const account of this.settings.accounts) {
-      keys[account.id] = accountKeyed(account) ? await this.keyState(account).catch(() => "missing") : "none";
-    }
-    return { settings: this.settings, keys, checks: Object.fromEntries(this.checks), presets: PRESETS };
+    settings.accounts.forEach((account, i) => {
+      keys[account.id] = states[i];
+    });
+    return { settings, keys, checks: Object.fromEntries(this.checks), presets: PRESETS };
   }
   async save(value) {
     const next = validateSettings(value);
-    const previous = new Map(this.settings.accounts.map((account) => [account.id, account]));
-    for (const [id, account] of previous) {
-      const kept = next.accounts.find((entry) => entry.id === id);
-      if (!kept) {
-        delete this.keyOrigins[id];
-        this.forgetCheck(id);
-        await removeHomes(this.dataDir, id).catch(() => void 0);
-      } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
-        delete this.keyOrigins[id];
-        this.forgetCheck(id);
-      } else if (kept.model !== account.model) this.forgetCheck(id);
-    }
-    this.settings = next;
-    await this.persist();
-    return { saved: true };
+    return this.serialized(async () => {
+      const keyOrigins = { ...this.keyOrigins };
+      const removed = [];
+      const changed = [];
+      for (const account of this.settings.accounts) {
+        const { id } = account;
+        const kept = next.accounts.find((entry) => entry.id === id);
+        if (!kept) {
+          delete keyOrigins[id];
+          removed.push(id);
+        } else if (originOf(kept.baseUrl) !== originOf(account.baseUrl) || kept.preset !== account.preset) {
+          delete keyOrigins[id];
+          changed.push(id);
+        } else if (kept.model !== account.model) changed.push(id);
+      }
+      await this.persist({ settings: next, keyOrigins });
+      this.settings = next;
+      this.keyOrigins = keyOrigins;
+      for (const id of [...removed, ...changed]) this.forgetCheck(id);
+      for (const id of removed) await removeHomes(this.dataDir, id).catch(() => void 0);
+      return { saved: true };
+    });
   }
   /** The page saved or removed a key: bind it to the account's address as it is now. */
   async keyChanged(accountId) {
-    const account = this.find(accountId);
-    if (!account) throw new Error("No such account.");
-    if (await this.readKey(account)) this.keyOrigins[account.id] = originOf(account.baseUrl);
-    else delete this.keyOrigins[account.id];
-    this.forgetCheck(account.id);
-    await this.persist();
-    return null;
+    return this.serialized(async () => {
+      const account = this.find(accountId);
+      if (!account) throw new Error("No such account.");
+      const keyOrigins = { ...this.keyOrigins };
+      if (await this.readKey(account)) keyOrigins[account.id] = originOf(account.baseUrl);
+      else delete keyOrigins[account.id];
+      this.forgetCheck(account.id);
+      await this.persist({ settings: this.settings, keyOrigins });
+      this.keyOrigins = keyOrigins;
+      return null;
+    });
   }
   /**
    * «Проверить»: an Ollama account on this computer lists the server's models; an account with a key gets a format
@@ -1144,21 +1285,27 @@ var resolveReady;
 var ready = new Promise((resolve) => {
   resolveReady = resolve;
 });
+var service = async () => {
+  const accounts = await ready;
+  await accounts.load();
+  return accounts;
+};
 serve({
   onInitialize: async (params, host) => {
     const dataDir = typeof params.dataDir === "string" ? params.dataDir : process.cwd();
-    const saved = await host.callHost("storage.get", { key: "accounts" }).catch(() => null);
-    resolveReady(new AccountsService({ host, dataDir, saved }));
+    const read = await host.callHost("storage.get", { key: "accounts" }).then((value) => ({ value }), () => null);
+    if (!read) host.log("warn", "The saved accounts could not be read; reading them again on the next request.");
+    resolveReady(new AccountsService({ host, dataDir, ...read ? { saved: read.value } : { unread: true } }));
   },
   methods: {
     // Host-only requests.
-    "canvastty.launch.options": async (params) => (await ready).launchOptions(params.provider),
-    "canvastty.launch.prepare": async (params) => (await ready).prepare(params),
-    "canvastty.tools.call": async (params) => (await ready).tool(String(params.tool), params.input ?? {}),
+    "canvastty.launch.options": async (params) => (await service()).launchOptions(params.provider),
+    "canvastty.launch.prepare": async (params) => (await service()).prepare(params),
+    "canvastty.tools.call": async (params) => (await service()).tool(String(params.tool), params.input ?? {}),
     // The settings page.
-    state: async () => (await ready).state(),
-    save: async (params) => (await ready).save(params.settings),
-    check: async (params) => (await ready).check(params.accountId),
-    keyChanged: async (params) => (await ready).keyChanged(params.accountId)
+    state: async () => (await service()).state(),
+    save: async (params) => (await service()).save(params.settings),
+    check: async (params) => (await service()).check(params.accountId),
+    keyChanged: async (params) => (await service()).keyChanged(params.accountId)
   }
 });

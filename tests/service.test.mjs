@@ -300,3 +300,72 @@ test('the account\'s Claude settings: a missing file is seeded, a broken one is 
     assert.equal(await readFile(path, 'utf8'), '{"keep": true}');
   }
 });
+
+test('storage that cannot be read at start is not "nothing saved": no empty list is shown or saved over the accounts', async (t) => {
+  const { storage, dataDir, host } = await fixture(t);
+  const saved = structuredClone(storage.accounts);
+  let broken = true;
+  const flaky = { ...host, callHost: async (method, params) => {
+    if (broken && method === 'storage.get') throw new Error('host busy');
+    return host.callHost(method, params);
+  } };
+  const service = new AccountsService({ host: flaky, dataDir, unread: true });
+  await assert.rejects(service.load(), /could not be read/);
+  await assert.rejects(service.save({ version: 1, accounts: [{ id: 'new', label: 'New', preset: 'ollama-local', baseUrl: 'http://127.0.0.1:11434', model: 'qwen3.5:9b', agents: ['claude'] }] }), /could not be read/);
+  assert.deepEqual(storage.accounts, saved, 'nothing was written over the saved accounts');
+  broken = false;
+  await service.load();
+  assert.deepEqual((await service.state()).settings.accounts.map(account => account.id), ['qwen-local', 'glm']);
+});
+
+test('a save or key binding the host fails to store changes nothing in memory or on disk', async (t) => {
+  const { service, storage, dataDir, host, secrets, context } = await fixture(t);
+  await service.prepare(context({}));
+  secrets['key.glm'] = KEY;
+  await service.keyChanged('glm');
+  const before = structuredClone(storage.accounts);
+  const real = host.callHost;
+  host.callHost = async (method, params) => { if (method === 'storage.set') throw new Error('disk full'); return real(method, params); };
+  await assert.rejects(service.save({ version: 1, accounts: [] }));
+  assert.deepEqual(service.settings, before.settings, 'the accounts in memory are the saved ones');
+  assert.equal((await service.state()).keys.glm, 'ok', 'the key binding is still the saved one');
+  assert.deepEqual(await readdir(join(dataDir, 'homes')), ['claude-qwen-local'], 'a removal that was not saved keeps the account home');
+  delete secrets['key.glm'];
+  await assert.rejects(service.keyChanged('glm'));
+  secrets['key.glm'] = KEY;
+  assert.equal((await service.state()).keys.glm, 'ok', 'a binding change that was not saved is not in memory');
+  assert.deepEqual(storage.accounts, before);
+});
+
+test('the settings page reads every account\'s key at once, not one after another', async (t) => {
+  const { service, host } = await fixture(t);
+  const accounts = Array.from({ length: 6 }, (_, n) => ({ id: `k${n}`, label: `K${n}`, preset: 'zai-anthropic', baseUrl: 'https://api.z.ai/api/anthropic', model: 'glm-4.6', agents: ['claude'] }));
+  await service.save({ version: 1, accounts });
+  const real = host.callHost;
+  let running = 0, most = 0;
+  host.callHost = async (method, params) => {
+    if (method !== 'secrets.get') return real(method, params);
+    running++; most = Math.max(most, running);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    running--;
+    return null;
+  };
+  const state = await service.state();
+  assert.deepEqual(Object.values(state.keys), Array(6).fill('missing'));
+  assert.equal(most, 6);
+});
+
+test('an Ollama answer without Content-Length is cut off at the size cap while it is read', async () => {
+  const { ollamaHttp } = await import('../src/launch/ollama.ts');
+  let pulled = 0;
+  const chunk = new Uint8Array(64 * 1024).fill(0x20);
+  const transport = async () => new Response(new ReadableStream({
+    pull(controller) { if (pulled >= 16 * 1024 * 1024) { controller.close(); return; } pulled += chunk.byteLength; controller.enqueue(chunk); }
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const answer = await ollamaHttp('http://127.0.0.1:1', transport)('GET', '/api/tags');
+  assert.deepEqual(answer, { status: 200, json: null });
+  assert.ok(pulled <= 4 * 1024 * 1024 + 3 * chunk.byteLength, `read ${pulled} bytes`);
+  // A small body without the header still parses.
+  const small = async () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{"version":"0.12.0"}')); controller.close(); } }), { status: 200 });
+  assert.deepEqual(await ollamaHttp('http://127.0.0.1:1', small)('GET', '/api/version'), { status: 200, json: { version: '0.12.0' } });
+});

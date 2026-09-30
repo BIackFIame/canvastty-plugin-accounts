@@ -19,6 +19,24 @@ const remote = (entry: Record<string, unknown>): boolean => typeof entry.remote_
 export type OllamaHttp = (method: 'GET' | 'POST', path: string, body?: unknown) => Promise<{ status: number; json: unknown }>;
 export type OllamaFetch = (url: string, init: RequestInit) => Promise<Response>;
 
+/** The body as text, read at most `limit` bytes; null (the rest cancelled) past it or on a read error. */
+async function boundedText(response: Response, limit: number): Promise<string | null> {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) { await reader.cancel().catch(() => undefined); return null; }
+      chunks.push(value);
+    }
+  } catch { return null; }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 export function ollamaHttp(baseUrl: string, transport: OllamaFetch = fetch, timeoutMs = 3_000): OllamaHttp {
   return async (method, path, body) => {
     let response: Response;
@@ -31,8 +49,9 @@ export function ollamaHttp(baseUrl: string, transport: OllamaFetch = fetch, time
     } catch { return { status: 0, json: null }; }
     const length = Number(response.headers.get('content-length') ?? 0);
     if (length > MAX_BODY) { await response.body?.cancel().catch(() => undefined); return { status: response.status, json: null }; }
-    const text = await response.text().catch(() => '');
-    if (text.length > MAX_BODY) return { status: response.status, json: null };
+    // Content-Length may be absent (chunked) or wrong: the cap holds while reading, not after.
+    const text = await boundedText(response, MAX_BODY);
+    if (text === null) return { status: response.status, json: null };
     try { return { status: response.status, json: text ? JSON.parse(text) as unknown : null }; } catch { return { status: response.status, json: null }; }
   };
 }
