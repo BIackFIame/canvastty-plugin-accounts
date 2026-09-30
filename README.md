@@ -1,6 +1,6 @@
 # CanvasTTY Accounts
 
-> **Status: preview.** This plugin needs CanvasTTY plugin API v2 (plugin services, launch contributors, session environments, decision hooks, plugin tools and card actions). Those extension points are proposed upstream and are not in a released CanvasTTY yet, so installing it on a current release fails the manifest check.
+> **Requires the CanvasTTY core with plugin API v2** (plugin services, launch contributors, session environments, decision hooks, plugin tools and card actions, and `launch.delegable`): the upcoming release after 1.7.0. CanvasTTY 1.7.0 and earlier do not have these extension points, so installing it there fails the manifest check.
 
 [Русский](README.ru.md)
 
@@ -18,7 +18,10 @@ Ollama model, Ollama Cloud, Z.AI, MiniMax, OpenRouter or any Anthropic- or OpenA
 
 Orchestrators get two tools: `canvastty-accounts__list_routes` (every account × agent, ready or why not) and
 `canvastty-accounts__pick_account` (the first ready account for an agent, skipping ones that cannot work now). Both
-answer with `launchOptions` to pass to `spawn_agent`. The plugin declares its launch options `delegable`: an
+answer with `launchOptions` to pass to `spawn_agent`. They probe only the accounts a requested row needs, four at a
+time; an Ollama too old for the launch is `ollama-old` with the launch's own reason, an agent without the requested
+effort is `no-effort`, and an unknown effort is an error. The plugin declares its launch options delegable
+(`launch.delegable` in the manifest; without it CanvasTTY refuses them in `spawn_agent`): an
 orchestrator's choice changes only the model, its endpoint and the reasoning effort. *I trust this folder* (a Codex
 `-c projects=…` trust or the account home's trust entry) is ignored for a subagent, the configs it writes (OpenCode,
 Kimi, Codex `-c`) set no approval, permission or sandbox keys, and CanvasTTY
@@ -30,7 +33,9 @@ home, so the person's `~/.claude` or `~/.codex` settings (their own allow or den
 - Claude Code: `ANTHROPIC_BASE_URL` (Ollama gets its server root), `ANTHROPIC_AUTH_TOKEN` (the key, or `ollama` for a
   local server), every model tier set to the account's model, `--model`, and the base URL repeated in `--settings` so a
   project's settings cannot redirect the key. Claude runs in the account's own `CLAUDE_CONFIG_DIR` under the plugin's
-  data folder, with onboarding done.
+  data folder, with onboarding done. Its `.claude.json` keeps what Claude wrote; a file that is not a settings object
+  is kept aside as `.claude.json.unreadable`, one that cannot be read refuses the launch, and the homes are private
+  (0700).
 - Codex: a provider given only by `-c` overrides (Responses wire API), a one-model catalog in the run's private
   folder, the account's own `CODEX_HOME`, and the key's variable named by `env_key`.
 - OpenCode: a private `OPENCODE_CONFIG` file (Anthropic APIs get `/v1`), the key as `{env:…}`.
@@ -47,6 +52,11 @@ home, so the person's `~/.claude` or `~/.codex` settings (their own allow or den
 Keys stay in CanvasTTY's encrypted plugin secrets; CanvasTTY puts them into the agent's environment itself and masks
 them in everything other agents read. Nothing is written to `~/.claude`, `~/.codex`, `~/.qwen`, `~/.kimi` or
 `~/.ollama`, and the agents' own sign-ins are never used for an account's endpoint.
+
+If the saved accounts cannot be read when the service starts, the page, launcher, launches and tools refuse until a
+later read succeeds; nothing is saved over them. Saves and key bindings change what the service shows only after
+CanvasTTY stored them. An Ollama answer is read up to 4 MiB. Between the service and CanvasTTY a frame is at most
+1 MiB, a host call fails after 30 s or past 64 in flight, and waiting events and logs are capped at 8 MiB.
 
 Needs CanvasTTY with the account launch points (`optionsFrom` launcher lists, `spawn_agent` `launchOptions`, merged
 Claude `--settings`); the Auto downgrade and `trustedFolder` need the Auto profile points (older CanvasTTY ignores them).
